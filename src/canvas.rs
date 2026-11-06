@@ -112,9 +112,10 @@ pub struct Canvas {
     pub link_style: layout::LinkStyle,
     /// What box select / click select may pick.
     pub select_mode: SelectMode,
-    /// Box-selected owned links and nodes.
+    /// Box-selected owned links, nodes, and text comments.
     box_links: HashSet<(u32, u32)>,
     sel_nodes: HashSet<u32>,
+    sel_notes: HashSet<u64>,
     /// Screen position where a Shift+drag box started.
     box_start: Option<Pos2>,
     /// Links the user asked to delete with several selected; the app drains it.
@@ -163,6 +164,7 @@ impl Default for Canvas {
             select_mode: SelectMode::All,
             box_links: HashSet::new(),
             sel_nodes: HashSet::new(),
+            sel_notes: HashSet::new(),
             box_start: None,
             extra_disconnects: Vec::new(),
             notes: Vec::new(),
@@ -304,6 +306,32 @@ fn markdown_job(src: &str, size: f32, wrap: f32) -> egui::text::LayoutJob {
     job
 }
 
+/// Screen rect and laid-out galley of a sticky text comment (`NoteKind::Text`).
+fn comment_rect_and_galley(
+    painter: &egui::Painter,
+    origin: Pos2,
+    z: f32,
+    n: &Note,
+) -> (Rect, std::sync::Arc<egui::Galley>) {
+    let width = (n.size.0 * z).max(40.0);
+    let wrap_w = (width - 16.0 * z).max(10.0);
+    let galley = if n.text.is_empty() {
+        painter.layout(
+            "(empty comment: double-click to edit)".to_string(),
+            FontId::proportional(12.0 * z),
+            Color32::from_gray(200),
+            wrap_w,
+        )
+    } else {
+        painter.layout_job(markdown_job(&n.text, 12.0 * z, wrap_w))
+    };
+    let r = Rect::from_min_size(
+        origin + vec2(n.pos.0, n.pos.1) * z,
+        vec2(width, galley.size().y + 14.0 * z),
+    );
+    (r, galley)
+}
+
 /// One piece of a cable between two points (corner points for zigzag).
 fn piece(style: layout::LinkStyle, a: Pos2, b: Pos2, z: f32, lane_id: u32) -> Vec<(f32, f32)> {
     match style {
@@ -380,6 +408,7 @@ impl Canvas {
             links: f.links,
             sink_hide_mode,
             link_style: f.link_style,
+            show_external: f.show_external,
             notes: f.notes,
             auto_connect_prevention: f.auto_connect_prevention,
             rules: RuleSet { groups, ..RuleSet::default() },
@@ -400,15 +429,16 @@ impl Canvas {
             links: self.links.clone(),
             sink_hide_mode: self.sink_hide_mode,
             link_style: self.link_style,
+            show_external: self.show_external,
             notes: self.notes.clone(),
             auto_connect_prevention: self.auto_connect_prevention,
             hide_all_sinks: self.sink_hide_mode == crate::storage::SinkHideMode::HideAll,
         }
     }
 
-    /// Move every selected node by `d` (world units), except `skip`.
-    fn move_selected(&mut self, g: &Graph, d: Vec2, skip: Option<u32>) {
-        let ids: Vec<u32> = self.sel_nodes.iter().copied().filter(|&o| Some(o) != skip).collect();
+    /// Move every selected node and text comment by `d` (world units), except `skip_node` / `skip_note`.
+    fn move_selected(&mut self, g: &Graph, d: Vec2, skip_node: Option<u32>, skip_note: Option<u64>) {
+        let ids: Vec<u32> = self.sel_nodes.iter().copied().filter(|&o| Some(o) != skip_node).collect();
         for o in ids {
             let Some(op) = self.pos.get_mut(&o) else { continue };
             *op = (op.0 + d.x, op.1 + d.y);
@@ -418,6 +448,14 @@ impl Canvas {
                 if layout::try_claim(&mut self.claimed, alive, &k, o) {
                     self.saved.insert(k, np);
                 }
+            }
+        }
+        for note in &mut self.notes {
+            if note.kind == NoteKind::Text
+                && self.sel_notes.contains(&note.id)
+                && Some(note.id) != skip_note
+            {
+                note.pos = (note.pos.0 + d.x, note.pos.1 + d.y);
             }
         }
     }
@@ -594,12 +632,12 @@ impl Canvas {
             let resp = ui
                 .interact(bar, ui.id().with(("note", n.id)), Sense::click_and_drag())
                 .on_hover_cursor(egui::CursorIcon::Grab)
-                .on_hover_text("Drag: move the block. Double-click: select the nodes inside, then drag to move them too");
+                .on_hover_text("Drag: move the block. Double-click: select the nodes and comments inside, then drag to move them too");
             if resp.dragged() {
                 let d = resp.drag_delta() / z;
                 self.notes[i].pos = (n.pos.0 + d.x, n.pos.1 + d.y);
                 if self.group_sel == Some(n.id) {
-                    self.move_selected(g, d, None);
+                    self.move_selected(g, d, None, None);
                 }
             }
             if resp.drag_stopped() {
@@ -767,6 +805,11 @@ impl Canvas {
                                 action = Some(Action::DestroySink { node_id: node.id });
                                 ui.close_menu();
                             }
+                        } else if node.is_source() {
+                            if ui.button("Destroy mic").clicked() {
+                                action = Some(Action::DestroySink { node_id: node.id });
+                                ui.close_menu();
+                            }
                         }
                         ui.menu_button("Color", |ui| {
                             ui.horizontal(|ui| {
@@ -801,6 +844,7 @@ impl Canvas {
                     let add = ui.input(|i| i.modifiers.shift);
                     if !add {
                         self.sel_nodes.clear();
+                        self.sel_notes.clear();
                         self.group_sel = None;
                     }
                     self.sel_nodes.insert(node.id);
@@ -813,7 +857,7 @@ impl Canvas {
                     self.pos.insert(node.id, p);
                     // Dragging one selected node moves the whole selection.
                     if self.sel_nodes.contains(&node.id) {
-                        self.move_selected(g, d, Some(node.id));
+                        self.move_selected(g, d, Some(node.id), None);
                     }
                     if let Some(ref k) = key {
                         let alive = |id| g.nodes.contains_key(&id);
@@ -911,16 +955,25 @@ impl Canvas {
             self.pending = None; // drag ended without us seeing the stop event
         }
 
-        // Double-click on a block title: select the nodes fully inside it.
+        // Double-click on a block title: select the nodes and text comments fully inside it.
         if let Some(bid) = select_group {
             if let Some(n) = self.notes.iter().find(|n| n.id == bid) {
                 let br = Rect::from_min_size(origin + vec2(n.pos.0, n.pos.1) * z, vec2(n.size.0, n.size.1) * z);
                 self.sel_nodes.clear();
+                self.sel_notes.clear();
                 self.box_links.clear();
                 self.selected = None;
                 for it in &items {
                     if br.contains_rect(it.rect) {
                         self.sel_nodes.insert(it.node.id);
+                    }
+                }
+                for note in &self.notes {
+                    if note.kind == NoteKind::Text {
+                        let (cr, _) = comment_rect_and_galley(&painter, origin, z, note);
+                        if br.contains_rect(cr) {
+                            self.sel_notes.insert(note.id);
+                        }
                     }
                 }
                 self.group_sel = Some(bid);
@@ -930,12 +983,20 @@ impl Canvas {
         // Pass 2: links (under the nodes). External ones only when revealed.
         let mut shapes: Vec<((u32, u32), Vec<Pos2>)> = Vec::new();
         let pairs: Vec<((u32, u32), bool)> = if self.virtual_mode {
-            self.links
+            let mut v: Vec<((u32, u32), bool)> = self
+                .links
                 .iter()
                 .filter(|l| l.enabled)
                 .filter_map(|l| crate::links::resolve(g, l))
                 .map(|p| (p, true))
-                .collect()
+                .collect();
+            for l in g.links.values().filter(|l| !g.is_owned(l)) {
+                let p = (l.out_port, l.in_port);
+                if !v.iter().any(|&(existing, _)| existing == p) {
+                    v.push((p, false));
+                }
+            }
+            v
         } else {
             g.links.values().map(|l| ((l.out_port, l.in_port), g.is_owned(l))).collect()
         };
@@ -1087,6 +1148,7 @@ impl Canvas {
                 let add = ui.input(|i| i.modifiers.ctrl);
                 if !add {
                     self.sel_nodes.clear();
+                    self.sel_notes.clear();
                     self.box_links.clear();
                     self.selected = None;
                     self.group_sel = None;
@@ -1095,6 +1157,14 @@ impl Canvas {
                     for it in &items {
                         if it.rect.intersects(bx) {
                             self.sel_nodes.insert(it.node.id);
+                        }
+                    }
+                    for note in &self.notes {
+                        if note.kind == NoteKind::Text {
+                            let (cr, _) = comment_rect_and_galley(&painter, origin, z, note);
+                            if cr.intersects(bx) {
+                                self.sel_notes.insert(note.id);
+                            }
                         }
                     }
                 }
@@ -1111,6 +1181,7 @@ impl Canvas {
         // Drop selections that no longer exist.
         self.box_links.retain(|p| selectable.contains(p));
         self.sel_nodes.retain(|id| g.nodes.contains_key(id));
+        self.sel_notes.retain(|id| self.notes.iter().any(|n| n.id == *id && n.kind == NoteKind::Text));
         if ui.input(|i| i.key_pressed(egui::Key::Delete)) && !self.box_links.is_empty() {
             self.extra_disconnects.extend(self.box_links.drain());
         }
@@ -1118,6 +1189,7 @@ impl Canvas {
         // Click selects the nearest link; click on empty space clears.
         if bg.clicked() {
             self.sel_nodes.clear();
+            self.sel_notes.clear();
             self.box_links.clear();
             self.group_sel = None;
         }
@@ -1373,18 +1445,7 @@ impl Canvas {
             }
             let n = self.notes[i].clone();
             let c = n.color;
-            let width = (n.size.0 * z).max(40.0);
-            let galley = if n.text.is_empty() {
-                painter.layout(
-                    "(empty comment: double-click to edit)".to_string(),
-                    FontId::proportional(12.0 * z),
-                    Color32::from_gray(200),
-                    (width - 16.0 * z).max(10.0),
-                )
-            } else {
-                painter.layout_job(markdown_job(&n.text, 12.0 * z, (width - 16.0 * z).max(10.0)))
-            };
-            let r = Rect::from_min_size(origin + vec2(n.pos.0, n.pos.1) * z, vec2(width, galley.size().y + 14.0 * z));
+            let (r, galley) = comment_rect_and_galley(&painter, origin, z, &n);
             if !r.intersects(rect) {
                 continue;
             }
@@ -1393,6 +1454,13 @@ impl Canvas {
                 CornerRadius::same(8),
                 Color32::from_black_alpha(55),
             );
+            if self.sel_notes.contains(&n.id) {
+                painter.rect_filled(
+                    r.expand(3.0 * z),
+                    CornerRadius::same(9),
+                    Color32::from_rgba_unmultiplied(92, 196, 230, 150),
+                );
+            }
             painter.rect_filled(r, CornerRadius::same(6), Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 235));
             painter.rect_filled(
                 Rect::from_min_size(r.min, vec2(r.width(), 5.0 * z)),
@@ -1407,9 +1475,23 @@ impl Canvas {
             let resp = ui
                 .interact(r, ui.id().with(("note", n.id)), Sense::click_and_drag())
                 .on_hover_cursor(egui::CursorIcon::Grab);
+            if resp.clicked() && self.select_mode != SelectMode::Links {
+                let add = ui.input(|i| i.modifiers.shift);
+                if !add {
+                    self.sel_nodes.clear();
+                    self.sel_notes.clear();
+                    self.group_sel = None;
+                }
+                self.sel_notes.insert(n.id);
+                self.box_links.clear();
+                self.selected = None;
+            }
             if resp.dragged() {
                 let d = resp.drag_delta() / z;
                 self.notes[i].pos = (n.pos.0 + d.x, n.pos.1 + d.y);
+                if self.sel_notes.contains(&n.id) {
+                    self.move_selected(g, d, None, Some(n.id));
+                }
             }
             if resp.drag_stopped() {
                 self.dirty = true;
@@ -1435,6 +1517,7 @@ impl Canvas {
             match op {
                 NoteOp::Delete(id) => {
                     self.notes.retain(|n| n.id != id);
+                    self.sel_notes.remove(&id);
                     self.dirty = true;
                 }
                 NoteOp::Color(id, c) => {
@@ -1551,7 +1634,10 @@ impl Canvas {
                 self.box_links.clear();
                 self.selected = None;
             }
-            SelectMode::Links => self.sel_nodes.clear(),
+            SelectMode::Links => {
+                self.sel_nodes.clear();
+                self.sel_notes.clear();
+            }
             SelectMode::All => {}
         }
 

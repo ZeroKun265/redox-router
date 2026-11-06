@@ -414,6 +414,40 @@ impl RuleSet {
     }
 }
 
+/// Convert a setup's `groups` list so that every `GroupEntry::Library` reference
+/// is embedded as a standalone `GroupEntry::Local` copy with a unique name,
+/// making an exported setup 100% portable without external library dependencies.
+pub fn standalone_groups(groups: &[GroupEntry], library: &[RuleGroup]) -> Vec<GroupEntry> {
+    let mut used_names: Vec<String> = Vec::new();
+    let mut out = Vec::with_capacity(groups.len());
+    for entry in groups {
+        match entry {
+            GroupEntry::Local(g) => {
+                let name = unique_name(&used_names, &g.name);
+                used_names.push(name.clone());
+                let mut copy = g.clone();
+                copy.name = name;
+                out.push(GroupEntry::Local(copy));
+            }
+            GroupEntry::Library { name, enabled } => {
+                let rules = library
+                    .iter()
+                    .find(|g| &g.name == name)
+                    .map(|g| g.rules.clone())
+                    .unwrap_or_default();
+                let uniq = unique_name(&used_names, name);
+                used_names.push(uniq.clone());
+                out.push(GroupEntry::Local(RuleGroup {
+                    name: uniq,
+                    enabled: *enabled,
+                    rules,
+                }));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,5 +729,33 @@ mod tests {
         set.to_library(set.groups.len() - 1);
         let names: Vec<_> = set.library.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, vec!["G", "G (2)"]);
+    }
+
+    #[test]
+    fn standalone_groups_inlines_library_groups_with_unique_names() {
+        let mut set = RuleSet::default();
+        set.groups.push(local("System noise", vec![rule(Field::Title, "plasma", Action::Hide)]));
+        set.to_library(0);
+        // Add a local group with the same base name to verify deduplication on export.
+        set.groups.push(local("System noise", vec![rule(Field::Title, " custom", Action::Show)]));
+
+        let exported = standalone_groups(&set.groups, &set.library);
+        assert_eq!(exported.len(), 2);
+        match &exported[0] {
+            GroupEntry::Local(g) => {
+                assert_eq!(g.name, "System noise");
+                assert!(g.enabled);
+                assert_eq!(g.rules.len(), 1);
+                assert_eq!(g.rules[0].pattern, "plasma");
+            }
+            GroupEntry::Library { .. } => panic!("expected Local group after standalone conversion"),
+        }
+        match &exported[1] {
+            GroupEntry::Local(g) => {
+                assert_eq!(g.name, "System noise (2)");
+                assert_eq!(g.rules.len(), 1);
+            }
+            GroupEntry::Library { .. } => panic!("expected Local group"),
+        }
     }
 }

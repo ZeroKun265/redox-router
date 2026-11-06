@@ -345,6 +345,51 @@ fn run(
                     }
                 }
             }
+            Command::CreateSource { name, description } => {
+                rlog!("command CreateSource name={name} description={description}");
+                let props = properties! {
+                    "factory.name" => "support.null-audio-sink",
+                    "node.name" => name,
+                    "node.description" => description,
+                    "media.class" => "Audio/Source/Virtual",
+                    "audio.position" => "FL,FR",
+                    "object.linger" => "false",
+                    "redox.owned" => "true"
+                };
+                match core_cmd.create_object::<Node>("adapter", &props) {
+                    Ok(node) => {
+                        rlog!("created virtual source node proxy, waiting for global bind");
+                        let gid = Rc::new(RefCell::new(None));
+                        let gid_bound = gid.clone();
+                        let tx_sink = tx_cmd.clone();
+                        let ctx_sink = ctx_cmd.clone();
+
+                        let listener = node
+                            .upcast_ref()
+                            .add_listener_local()
+                            .bound(move |id| {
+                                rlog!("owned source bound to global id {id}");
+                                *gid_bound.borrow_mut() = Some(id);
+                                let _ = tx_sink.send(Event::OwnedNodeAdded(id));
+                                ctx_sink.request_repaint();
+                            })
+                            .removed(move || {
+                                rlog!("owned source proxy removed by server");
+                            })
+                            .register();
+
+                        owned_sinks_cmd.borrow_mut().push(OwnedSink {
+                            _node: node,
+                            global_id: gid,
+                            _listener: listener,
+                        });
+                    }
+                    Err(e) => {
+                        rlog!("create virtual mic failed: {e}");
+                        notify(Event::Error(format!("could not create virtual mic: {e}")));
+                    }
+                }
+            }
             Command::DestroySink { node_id } => {
                 rlog!("command DestroySink node_id={node_id}");
                 owned_sinks_cmd.borrow_mut().retain(|os| {

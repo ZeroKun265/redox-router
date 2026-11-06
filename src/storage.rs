@@ -56,6 +56,9 @@ pub struct LayoutFile {
     /// Curved or zigzag cables.
     #[serde(default)]
     pub link_style: crate::layout::LinkStyle,
+    /// Whether external (non-Redox) links are shown on this setup's canvas.
+    #[serde(default)]
+    pub show_external: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,10 +81,21 @@ pub struct Note {
     pub color: [u8; 3],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VirtualDeviceKind {
+    /// Virtual speaker (`Audio/Sink`).
+    #[default]
+    Sink,
+    /// Virtual microphone (`Audio/Source/Virtual`).
+    Source,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedSink {
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub kind: VirtualDeviceKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -149,6 +163,7 @@ impl Default for LayoutFile {
             hide_all_sinks: false,
             notes: Vec::new(),
             link_style: Default::default(),
+            show_external: false,
         }
     }
 }
@@ -199,11 +214,203 @@ pub fn save_library(library: &[RuleGroup]) -> Result<(), String> {
     save_json("rule_library.json", &library)
 }
 
-/// Persistent Redox-created virtual sinks.
+/// Persistent Redox-created virtual sinks and microphones.
 pub fn load_sinks() -> Vec<SavedSink> {
     load_json("sinks.json").unwrap_or_default()
 }
 
 pub fn save_sinks(sinks: &[SavedSink]) -> Result<(), String> {
     save_json("sinks.json", &sinks)
+}
+
+/// Directory for exported setup `.json` files (`~/.config/RedoxRouter/exports`).
+pub fn exports_dir() -> Option<PathBuf> {
+    ProjectDirs::from("", "ZeroKun265", "RedoxRouter").map(|d| d.config_dir().join("exports"))
+}
+
+/// Sanitize a setup name into a safe filename stem.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "setup".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Default file path for exporting a setup with the given name.
+pub fn default_export_path(setup_name: &str) -> PathBuf {
+    let file = format!("{}.json", sanitize_filename(setup_name));
+    exports_dir()
+        .map(|d| d.join(&file))
+        .unwrap_or_else(|| PathBuf::from(file))
+}
+
+/// List existing `.json` files in the exports directory.
+pub fn list_export_files() -> Vec<PathBuf> {
+    let Some(dir) = exports_dir() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Expand leading `~/` to the user's home directory if present.
+pub fn expand_tilde(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+/// Build a portable `Setup<LayoutFile>` where any referenced library rule groups
+/// are embedded as unique local rule groups, and serialize it to pretty JSON.
+pub fn export_setup_json(
+    setup: &crate::setups::Setup<LayoutFile>,
+    library: &[RuleGroup],
+) -> Result<String, String> {
+    let mut portable = setup.clone();
+    if !portable.data.rules.is_empty() {
+        let group = RuleGroup {
+            name: "Rules".to_string(),
+            enabled: true,
+            rules: std::mem::take(&mut portable.data.rules),
+        };
+        portable.data.groups.insert(0, GroupEntry::Local(group));
+    }
+    portable.data.groups = crate::rules::standalone_groups(&portable.data.groups, library);
+    serde_json::to_string_pretty(&portable).map_err(|e| e.to_string())
+}
+
+/// Write a portable setup JSON to the specified file path.
+pub fn export_setup_to_path(
+    path: &std::path::Path,
+    setup: &crate::setups::Setup<LayoutFile>,
+    library: &[RuleGroup],
+) -> Result<(), String> {
+    let json = export_setup_json(setup, library)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// Parse an imported setup from JSON. Accepts either a full `Setup<LayoutFile>`
+/// (`{ "name": "...", "data": { ... } }`) or a bare `LayoutFile` (using `fallback_name`).
+/// Any library references in the imported file are converted to standalone local groups.
+pub fn parse_imported_setup(
+    json: &str,
+    fallback_name: &str,
+    library: &[RuleGroup],
+) -> Result<crate::setups::Setup<LayoutFile>, String> {
+    let mut setup: crate::setups::Setup<LayoutFile> =
+        match serde_json::from_str::<crate::setups::Setup<LayoutFile>>(json) {
+            Ok(s) => s,
+            Err(_) => {
+                let data: LayoutFile =
+                    serde_json::from_str(json).map_err(|e| format!("invalid setup JSON: {e}"))?;
+                let name = if fallback_name.trim().is_empty() {
+                    "Imported".to_string()
+                } else {
+                    fallback_name.trim().to_string()
+                };
+                crate::setups::Setup { name, data }
+            }
+        };
+    if setup.name.trim().is_empty() {
+        setup.name = "Imported".to_string();
+    }
+    if !setup.data.rules.is_empty() {
+        let group = RuleGroup {
+            name: "Rules".to_string(),
+            enabled: true,
+            rules: std::mem::take(&mut setup.data.rules),
+        };
+        setup.data.groups.insert(0, GroupEntry::Local(group));
+    }
+    setup.data.groups = crate::rules::standalone_groups(&setup.data.groups, library);
+    Ok(setup)
+}
+
+/// Read and parse a setup from a file path on disk.
+pub fn import_setup_from_path(
+    path: &std::path::Path,
+    library: &[RuleGroup],
+) -> Result<crate::setups::Setup<LayoutFile>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let fallback = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Imported");
+    parse_imported_setup(&text, fallback, library)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::{Action, Field, Mode};
+
+    #[test]
+    fn export_and_import_setup_makes_library_groups_standalone() {
+        let lib_rule = Rule {
+            field: Field::Title,
+            mode: Mode::Pattern,
+            pattern: "HideMe".to_string(),
+            action: Action::Hide,
+            enabled: true,
+        };
+        let library = vec![RuleGroup {
+            name: "Shared Filter".to_string(),
+            enabled: true,
+            rules: vec![lib_rule.clone()],
+        }];
+        let mut data = LayoutFile::default();
+        data.groups.push(GroupEntry::Library {
+            name: "Shared Filter".to_string(),
+            enabled: true,
+        });
+        let setup = crate::setups::Setup {
+            name: "Streaming".to_string(),
+            data,
+        };
+
+        let json = export_setup_json(&setup, &library).unwrap();
+        // Importing on another machine with an empty library still preserves the rules!
+        let imported = parse_imported_setup(&json, "Fallback", &[]).unwrap();
+        assert_eq!(imported.name, "Streaming");
+        assert_eq!(imported.data.groups.len(), 1);
+        match &imported.data.groups[0] {
+            GroupEntry::Local(g) => {
+                assert_eq!(g.name, "Shared Filter");
+                assert!(g.enabled);
+                assert_eq!(g.rules, vec![lib_rule]);
+            }
+            GroupEntry::Library { .. } => panic!("expected standalone Local group"),
+        }
+    }
+
+    #[test]
+    fn saved_sink_defaults_to_sink_kind_when_omitted() {
+        let old_json = r#"{"name":"Virtual_Sink_1","description":"Virtual Sink"}"#;
+        let parsed: SavedSink = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed.kind, VirtualDeviceKind::Sink);
+    }
 }

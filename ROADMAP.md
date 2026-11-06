@@ -38,14 +38,14 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - [x] Volume sliders on audio nodes (Props via `set_param`; cubic curve 0-150%, double-click = 100%, click the % to mute; UNTESTED, math + state merge tested)
 - [x] Volume slider only on application streams. Devices (sinks/sources) show a read-only bar, using the sound card route volume when available so it matches the system applet; they are controlled by the system volume control (decision 2026-11-05, avoids duplicate control)
 - [ ] Volume: per-channel sliders, show both route (hardware) and node (software) volume if they differ
-- [ ] Virtual microphone sinks
+- [x] Virtual microphone sources: "Create mic…" dialog (`support.null-audio-sink` via `adapter` factory with `media.class = Audio/Source/Virtual`, `object.linger: false`, `redox.owned: true`) and "Destroy mic" menu/context action; saved in `sinks.json` alongside virtual sinks (UNTESTED)
 - [x] Virtual speaker sinks: "Create sink…" dialog (`support.null-audio-sink` via `adapter` factory, `object.linger: false`, `redox.owned: true`) and "Destroy sink" menu/context action; saved in `sinks.json` so Redox sinks are automatically recreated on startup and cleaned up when RedoxRouter exits
 - [x] Sink visibility modes (`Show all`, `Hide Redox only`, `Hide all`) + `Action::Show` in the rules engine to selectively unhide sinks via filter rules
 - [x] Audio bleed / auto-connection prevention (`Allow all`, `Block for managed nodes`, `Block for all new apps`) to automatically sever unwanted external/WirePlumber default links
 - [x] Composite node persistence key (`"{node.name}|{media.class}"`) so nodes sharing a technical name (e.g. Discord input vs output `WEBRTC VoiceEngine`) have independent positions, widths, nicknames, visibility, and manual colors
 - [x] Saved links: links you create/take over are saved by node+port name in layout.json and auto-connected whenever both ends exist; "Saved links" window (pause/remove). Missing nodes are skipped. Duplicate node names use the oldest node. Engine tested, UI UNTESTED
-- [x] Setups as tabs (`setups.json`; old layout.json migrates into "Main"). Each setup = layout, rules, saved links. Click a tab to view it; "Make active" removes our links the new setup doesn't use and auto-connects its links (● = live). Right-click tab: Rename/Duplicate/Delete; "+" = new setup copying layout+rules without links. Inactive setups show and edit their own saved links (virtual, nothing live changes). List logic tested, UI UNTESTED
-- [ ] Setups: per-setup window/pan, export/import a setup
+- [x] Setups as tabs (`setups.json`; old layout.json migrates into "Main"). Each setup = layout, rules, saved links. Click a tab to view it; "Make active" removes our links the new setup doesn't use and auto-connects its links (● = live). Right-click tab: Rename/Duplicate/Export/Delete; "+" = new setup copying layout+rules without links. Inactive setups show and edit their own saved links (virtual, nothing live changes). List logic tested, UI UNTESTED
+- [x] Setups: export/import a setup as portable JSON (library rule groups used by the exported tab are converted to standalone local groups with unique names so exports are 100% portable; engine tested, UI UNTESTED)
 - [x] Text comments: right-click empty canvas -> Add comment; drag, double-click to edit, drag right edge for width, right-click for color/delete (saved per setup; UNTESTED)
 - [x] Translucent colored blocks with a title bar (drag the bar, resize with the corner grip, right-click for edit/color/delete; drawn behind links and nodes; UNTESTED)
 - [ ] Cables as splines
@@ -69,4 +69,4 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - [x] UI theme refresh: darker rounded panels and widgets, teal accent, dot-grid canvas, node shadows/gloss, glowing links, ringed ports (apply_theme in main.rs; UNTESTED visually)
 - [x] Animated flowing dots on links, glow on external links too; nickname tab drawn behind its node (fused look)
 - [x] Markdown in comments (headings, bullets, bold, italic, code, strike; custom subset parser, tested; rendering UNTESTED). Bold is shown as brighter text with wider letters since egui has no bold font
-- [x] Double-click a block title = select the nodes fully inside; dragging the title then moves them too. Rename a block via right-click > Edit text
+- [x] Double-click a block title = select the nodes and text comments fully inside; dragging the title then moves them too. Rename a block via right-click > Edit text (UNTESTED)

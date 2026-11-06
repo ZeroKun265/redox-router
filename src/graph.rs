@@ -82,9 +82,11 @@ pub enum Command {
     /// Destroy another program's link (`link_id`) and create our own between
     /// the same ports.
     TakeOver { link_id: u32, out_node: u32, out_port: u32, in_node: u32, in_port: u32 },
-    /// Create a virtual null audio sink.
+    /// Create a virtual null audio sink (virtual speaker).
     CreateSink { name: String, description: String },
-    /// Destroy a sink / node by its global ID.
+    /// Create a virtual audio source (virtual microphone).
+    CreateSource { name: String, description: String },
+    /// Destroy a sink / source / node by its global ID.
     DestroySink { node_id: u32 },
 }
 
@@ -115,6 +117,11 @@ impl NodeInfo {
     /// True for audio, video, or MIDI sink nodes (e.g. "Audio/Sink").
     pub fn is_sink(&self) -> bool {
         self.media_class.to_lowercase().contains("sink")
+    }
+
+    /// True for audio, video, or MIDI source nodes (e.g. "Audio/Source", "Audio/Source/Virtual").
+    pub fn is_source(&self) -> bool {
+        self.media_class.to_lowercase().contains("source")
     }
 
     /// Best human-readable label.

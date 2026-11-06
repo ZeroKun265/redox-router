@@ -43,10 +43,14 @@ struct RedoxRouter {
     severed_links: HashSet<u32>,
     /// Ports the user tried to connect although another program already links them.
     prompt: Option<(u32, u32)>,
-    show_create_sink: bool,
+    show_create_sink: Option<storage::VirtualDeviceKind>,
     new_sink_name: String,
     new_sink_desc: String,
     saved_sinks: Vec<storage::SavedSink>,
+    /// Exporting a setup: (setup index, destination file path, status/error message).
+    exporting_setup: Option<(usize, String, Option<Result<String, String>>)>,
+    /// Importing a setup: (file path input, raw JSON input, error message).
+    importing_setup: Option<(String, String, Option<String>)>,
     last_save: Instant,
     save_error: Option<String>,
 }
@@ -59,10 +63,17 @@ impl RedoxRouter {
         canvas.rules.library = storage::load_library();
         let saved_sinks = storage::load_sinks();
         for sink in &saved_sinks {
-            let _ = cmd.send(Command::CreateSink {
-                name: sink.name.clone(),
-                description: sink.description.clone(),
-            });
+            let msg = match sink.kind {
+                storage::VirtualDeviceKind::Sink => Command::CreateSink {
+                    name: sink.name.clone(),
+                    description: sink.description.clone(),
+                },
+                storage::VirtualDeviceKind::Source => Command::CreateSource {
+                    name: sink.name.clone(),
+                    description: sink.description.clone(),
+                },
+            };
+            let _ = cmd.send(msg);
         }
         Self {
             rx,
@@ -77,10 +88,12 @@ impl RedoxRouter {
             show_debug: false,
             show_rules: false,
             show_links: false,
-            show_create_sink: false,
+            show_create_sink: None,
             new_sink_name: String::new(),
             new_sink_desc: String::new(),
             saved_sinks,
+            exporting_setup: None,
+            importing_setup: None,
             requested: HashSet::new(),
             severed_links: HashSet::new(),
             prompt: None,
@@ -313,11 +326,9 @@ impl RedoxRouter {
         self.sync_current();
         let library = std::mem::take(&mut self.canvas.rules.library);
         let library_dirty = self.canvas.rules.library_dirty;
-        let external = self.canvas.show_external;
         let mut c = Canvas::with_saved(self.setups.items[idx].data.clone());
         c.rules.library = library;
         c.rules.library_dirty = library_dirty;
-        c.show_external = external;
         c.dirty = true;
         self.canvas = c;
         self.viewing = idx;
@@ -361,6 +372,8 @@ impl RedoxRouter {
             Add,
             Duplicate(usize),
             Rename(usize),
+            Export(usize),
+            Import,
             Delete(usize),
             MakeActive,
         }
@@ -383,6 +396,10 @@ impl RedoxRouter {
                             op = Some(TabOp::Duplicate(i));
                             ui.close_menu();
                         }
+                        if ui.button("Export…").clicked() {
+                            op = Some(TabOp::Export(i));
+                            ui.close_menu();
+                        }
                         let can_delete = !active && self.setups.items.len() > 1;
                         if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
                             op = Some(TabOp::Delete(i));
@@ -396,6 +413,20 @@ impl RedoxRouter {
                     .clicked()
                 {
                     op = Some(TabOp::Add);
+                }
+                if ui
+                    .button("Export…")
+                    .on_hover_text("Export the viewed setup to a portable JSON file (library rule groups are embedded as unique local groups)")
+                    .clicked()
+                {
+                    op = Some(TabOp::Export(self.viewing));
+                }
+                if ui
+                    .button("Import…")
+                    .on_hover_text("Import a setup from a JSON file or pasted JSON")
+                    .clicked()
+                {
+                    op = Some(TabOp::Import);
                 }
                 if self.viewing != self.setups.active {
                     if ui.button("Make active").clicked() {
@@ -422,6 +453,19 @@ impl RedoxRouter {
                 self.canvas.dirty = true;
             }
             Some(TabOp::Rename(i)) => self.renaming = Some((i, self.setups.items[i].name.clone())),
+            Some(TabOp::Export(i)) => {
+                self.sync_current();
+                if let Some(s) = self.setups.items.get(i) {
+                    let path = storage::default_export_path(&s.name).display().to_string();
+                    self.exporting_setup = Some((i, path, None));
+                }
+            }
+            Some(TabOp::Import) => {
+                let default_dir = storage::exports_dir()
+                    .map(|d| format!("{}/", d.display()))
+                    .unwrap_or_default();
+                self.importing_setup = Some((default_dir, String::new(), None));
+            }
             Some(TabOp::Delete(i)) => {
                 if i == self.viewing {
                     self.switch_to(self.setups.active);
@@ -495,17 +539,24 @@ impl RedoxRouter {
     }
 
     fn create_sink_window(&mut self, ctx: &egui::Context) {
-        if !self.show_create_sink {
+        let Some(kind) = self.show_create_sink else {
             return;
-        }
+        };
+        let is_mic = kind == storage::VirtualDeviceKind::Source;
+        let title = if is_mic { "Create Virtual Microphone" } else { "Create Virtual Sink" };
+        let desc_label = if is_mic {
+            "Create a virtual microphone (Audio/Source/Virtual):"
+        } else {
+            "Create a virtual audio sink (null audio sink):"
+        };
         let mut create = false;
         let mut cancel = false;
-        egui::Window::new("Create Virtual Sink")
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .default_width(320.0)
             .show(ctx, |ui| {
-                ui.label("Create a virtual audio sink (null audio sink):");
+                ui.label(desc_label);
                 ui.add_space(4.0);
                 egui::Grid::new("create_sink_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("Technical Name:");
@@ -534,9 +585,11 @@ impl RedoxRouter {
                 let sink = storage::SavedSink {
                     name: name.clone(),
                     description: description.clone(),
+                    kind,
                 };
                 if let Some(existing) = self.saved_sinks.iter_mut().find(|s| s.name == sink.name) {
                     existing.description = sink.description;
+                    existing.kind = kind;
                 } else {
                     self.saved_sinks.push(sink);
                 }
@@ -547,13 +600,206 @@ impl RedoxRouter {
                     .values()
                     .any(|n| self.graph.is_node_owned(n) && n.name == name);
                 if !already_live {
-                    self.send(Command::CreateSink { name, description });
+                    let cmd = match kind {
+                        storage::VirtualDeviceKind::Sink => Command::CreateSink { name, description },
+                        storage::VirtualDeviceKind::Source => Command::CreateSource { name, description },
+                    };
+                    self.send(cmd);
                 }
             }
-            self.show_create_sink = false;
+            self.show_create_sink = None;
         }
         if cancel {
-            self.show_create_sink = false;
+            self.show_create_sink = None;
+        }
+    }
+
+    fn export_window(&mut self, ctx: &egui::Context) {
+        let Some((idx, ref mut path_str, ref mut status)) = self.exporting_setup else {
+            return;
+        };
+        let Some(setup) = self.setups.items.get(idx) else {
+            self.exporting_setup = None;
+            return;
+        };
+        let json_res = storage::export_setup_json(setup, &self.canvas.rules.library);
+        let mut close = false;
+        let mut save_file = false;
+        let mut copy_clip = false;
+        egui::Window::new(format!("Export setup \"{}\"", setup.name))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Exports this setup as a standalone, 100% portable JSON file. \
+                     Any library rule groups used by this setup are embedded as unique local groups.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("File path:");
+                    ui.add(
+                        egui::TextEdit::singleline(path_str)
+                            .hint_text("/path/to/setup.json")
+                            .desired_width(340.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Save to file").clicked() {
+                        save_file = true;
+                    }
+                    if ui.button("Copy JSON to clipboard").clicked() {
+                        copy_clip = true;
+                    }
+                    if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
+                });
+                if let Some(res) = status {
+                    match res {
+                        Ok(msg) => {
+                            ui.colored_label(egui::Color32::from_rgb(110, 210, 140), msg);
+                        }
+                        Err(err) => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, err);
+                        }
+                    }
+                }
+                if let Ok(ref json) = json_res {
+                    ui.collapsing("Preview exported JSON", |ui| {
+                        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                            let mut preview = json.as_str();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut preview)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    });
+                }
+            });
+        if save_file {
+            let expanded = storage::expand_tilde(path_str);
+            if let Some(setup) = self.setups.items.get(idx) {
+                let res = storage::export_setup_to_path(&expanded, setup, &self.canvas.rules.library)
+                    .map(|()| format!("Saved to {}", expanded.display()));
+                if let Some((_, _, st)) = &mut self.exporting_setup {
+                    *st = Some(res);
+                }
+            }
+        }
+        if copy_clip {
+            if let Ok(json) = json_res {
+                ctx.copy_text(json);
+                if let Some((_, _, st)) = &mut self.exporting_setup {
+                    *st = Some(Ok("Copied portable setup JSON to clipboard.".to_string()));
+                }
+            }
+        }
+        if close {
+            self.exporting_setup = None;
+        }
+    }
+
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let Some((ref mut path_str, ref mut raw_json, ref mut err_msg)) = self.importing_setup else {
+            return;
+        };
+        let export_files = storage::list_export_files();
+        let mut close = false;
+        let mut load_from_path: Option<std::path::PathBuf> = None;
+        let mut load_from_raw = false;
+        egui::Window::new("Import Setup")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                if !export_files.is_empty() {
+                    ui.strong("Saved exports in config folder:");
+                    egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                        for file in &export_files {
+                            ui.horizontal(|ui| {
+                                let name = file
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("setup.json");
+                                ui.monospace(name);
+                                if ui.small_button("Import").clicked() {
+                                    load_from_path = Some(file.clone());
+                                }
+                            });
+                        }
+                    });
+                    ui.separator();
+                }
+                ui.label("Import from a JSON file path:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(path_str)
+                            .hint_text("~/path/to/setup.json")
+                            .desired_width(320.0),
+                    );
+                    if ui.button("Load file").clicked() {
+                        load_from_path = Some(storage::expand_tilde(path_str));
+                    }
+                });
+                ui.separator();
+                ui.label("Or paste exported setup JSON below:");
+                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(raw_json)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("{ \"name\": \"...\", \"data\": { ... } }")
+                            .desired_rows(5)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                if let Some(err) = err_msg {
+                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!raw_json.trim().is_empty(), egui::Button::new("Import pasted JSON"))
+                        .clicked()
+                    {
+                        load_from_raw = true;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
+                });
+            });
+
+        let imported = if let Some(path) = load_from_path {
+            Some(storage::import_setup_from_path(&path, &self.canvas.rules.library))
+        } else if load_from_raw {
+            let json = self
+                .importing_setup
+                .as_ref()
+                .map(|(_, j, _)| j.clone())
+                .unwrap_or_default();
+            Some(storage::parse_imported_setup(&json, "Imported", &self.canvas.rules.library))
+        } else {
+            None
+        };
+
+        if let Some(res) = imported {
+            match res {
+                Ok(setup) => {
+                    self.sync_current();
+                    let idx = self.setups.add(&setup.name, setup.data);
+                    self.switch_to(idx);
+                    self.canvas.dirty = true;
+                    self.importing_setup = None;
+                }
+                Err(e) => {
+                    if let Some((_, _, err)) = &mut self.importing_setup {
+                        *err = Some(e);
+                    }
+                }
+            }
+        } else if close {
+            self.importing_setup = None;
         }
     }
 
@@ -1044,7 +1290,9 @@ impl eframe::App for RedoxRouter {
                         }
                     });
                 }
-                ui.checkbox(&mut self.canvas.show_external, "Show external links");
+                if ui.checkbox(&mut self.canvas.show_external, "Show external links").changed() {
+                    self.canvas.dirty = true;
+                }
                 ui.menu_button(format!("Bleed: {}", self.canvas.auto_connect_prevention.label()), |ui| {
                     for mode in storage::AutoConnectPrevention::ALL {
                         if ui.selectable_label(self.canvas.auto_connect_prevention == mode, mode.label()).clicked() {
@@ -1070,10 +1318,10 @@ impl eframe::App for RedoxRouter {
                 .on_hover_text("Control visibility of audio sinks. In the Rules window, add rules with 'Show' action to selectively unhide specific sinks.");
                 if ui
                     .button("Create sink…")
-                    .on_hover_text("Create a virtual null audio sink")
+                    .on_hover_text("Create a virtual null audio sink (virtual speaker)")
                     .clicked()
                 {
-                    self.show_create_sink = true;
+                    self.show_create_sink = Some(storage::VirtualDeviceKind::Sink);
                     self.new_sink_name = format!(
                         "Virtual_Sink_{}",
                         self.graph.nodes.values().filter(|n| n.is_sink()).count() + 1
@@ -1093,6 +1341,38 @@ impl eframe::App for RedoxRouter {
                 if !sinks.is_empty() {
                     ui.menu_button("Destroy sink", |ui| {
                         for (id, label) in &sinks {
+                            if ui.button(label).clicked() {
+                                self.destroy_sink(*id);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+                if ui
+                    .button("Create mic…")
+                    .on_hover_text("Create a virtual microphone (Audio/Source/Virtual)")
+                    .clicked()
+                {
+                    self.show_create_sink = Some(storage::VirtualDeviceKind::Source);
+                    self.new_sink_name = format!(
+                        "Virtual_Mic_{}",
+                        self.graph.nodes.values().filter(|n| n.is_source()).count() + 1
+                    );
+                    self.new_sink_desc = "Virtual Mic".to_string();
+                }
+                let mics: Vec<(u32, String)> = self
+                    .graph
+                    .nodes
+                    .values()
+                    .filter(|n| n.is_source())
+                    .map(|n| {
+                        let tag = if self.graph.is_node_owned(n) { " [Redox]" } else { "" };
+                        (n.id, format!("#{} {}{}", n.id, n.label(), tag))
+                    })
+                    .collect();
+                if !mics.is_empty() {
+                    ui.menu_button("Destroy mic", |ui| {
+                        for (id, label) in &mics {
                             if ui.button(label).clicked() {
                                 self.destroy_sink(*id);
                                 ui.close_menu();
@@ -1155,6 +1435,8 @@ impl eframe::App for RedoxRouter {
         self.inactive_window(ctx);
         self.reset_window(ctx);
         self.create_sink_window(ctx);
+        self.export_window(ctx);
+        self.import_window(ctx);
         self.maybe_save(ctx);
     }
 }
