@@ -17,6 +17,9 @@ pub struct SavedLink {
     pub in_port: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Points (world coordinates) the cable is routed through.
+    #[serde(default)]
+    pub waypoints: Vec<(f32, f32)>,
 }
 
 impl SavedLink {
@@ -41,7 +44,13 @@ pub fn from_ports(g: &Graph, out_port: u32, in_port: u32) -> Option<SavedLink> {
         in_node: g.nodes.get(&pi.node_id)?.name.clone(),
         in_port: pi.name.clone(),
         enabled: true,
+        waypoints: Vec::new(),
     })
+}
+
+/// Index of the saved link with these ends.
+pub fn find(links: &[SavedLink], l: &SavedLink) -> Option<usize> {
+    links.iter().position(|x| x.same_ends(l))
 }
 
 /// Add (or re-enable) a saved link. Returns true if anything changed.
@@ -208,6 +217,7 @@ mod tests {
             in_node: "app".into(),
             in_port: "input_FL".into(),
             enabled: true,
+            waypoints: Vec::new(),
         }
     }
 
@@ -339,6 +349,7 @@ mod tests {
                 in_node: "Music_Sink".into(),
                 in_port: "playback_FL".into(),
                 enabled: true,
+                waypoints: Vec::new(),
             },
             SavedLink {
                 out_node: "Music_Sink".into(),
@@ -346,6 +357,7 @@ mod tests {
                 in_node: "alsa_output".into(),
                 in_port: "playback_FL".into(),
                 enabled: true,
+                waypoints: Vec::new(),
             },
         ];
 

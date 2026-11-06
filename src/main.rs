@@ -5,6 +5,7 @@
 mod canvas;
 mod graph;
 mod layout;
+mod markdown;
 mod links;
 mod pw_backend;
 mod rules;
@@ -364,7 +365,7 @@ impl RedoxRouter {
             MakeActive,
         }
         let mut op = None;
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        egui::TopBottomPanel::top("tabs").frame(bar_frame()).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (i, s) in self.setups.items.iter().enumerate() {
                     let active = i == self.setups.active;
@@ -987,9 +988,14 @@ impl eframe::App for RedoxRouter {
         self.auto_connect();
         self.enforce_bleed_prevention();
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        egui::TopBottomPanel::top("top").frame(bar_frame()).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.strong("RedoxRouter");
+                ui.label(
+                    egui::RichText::new("RedoxRouter")
+                        .strong()
+                        .size(16.0)
+                        .color(egui::Color32::from_rgb(92, 196, 230)),
+                );
                 ui.label(format!(
                     "{} nodes, {} ports, {} links ({} yours)",
                     self.graph.nodes.len(),
@@ -1000,6 +1006,15 @@ impl eframe::App for RedoxRouter {
                 if ui.button("Reset all settings…").clicked() {
                     self.confirm_reset = true;
                 }
+                egui::ComboBox::from_id_salt("link_style")
+                    .selected_text(self.canvas.link_style.label())
+                    .show_ui(ui, |ui| {
+                        for st in layout::LinkStyle::ALL {
+                            if ui.selectable_value(&mut self.canvas.link_style, st, st.label()).changed() {
+                                self.canvas.dirty = true;
+                            }
+                        }
+                    });
                 if ui.button("Reset layout").clicked() {
                     self.canvas.reset_layout();
                 }
@@ -1129,6 +1144,9 @@ impl eframe::App for RedoxRouter {
         if let Some(a) = action {
             self.handle(a);
         }
+        for (out_port, in_port) in std::mem::take(&mut self.canvas.extra_disconnects) {
+            self.handle(Action::Disconnect { out_port, in_port });
+        }
 
         self.prompt_window(ctx);
         self.rules_window(ctx);
@@ -1141,6 +1159,53 @@ impl eframe::App for RedoxRouter {
     }
 }
 
+/// Global look: darker panels, rounded widgets, teal accent, soft shadows.
+fn apply_theme(ctx: &egui::Context) {
+    use egui::{Color32, CornerRadius, Shadow, Stroke};
+    let accent = Color32::from_rgb(92, 196, 230);
+    ctx.set_visuals(egui::Visuals::dark());
+    ctx.style_mut(|s| {
+        let v = &mut s.visuals;
+        v.panel_fill = Color32::from_rgb(28, 29, 35);
+        v.window_fill = Color32::from_rgb(34, 36, 43);
+        v.extreme_bg_color = Color32::from_rgb(20, 21, 26);
+        v.faint_bg_color = Color32::from_rgb(40, 42, 50);
+        v.window_stroke = Stroke::new(1.0_f32, Color32::from_gray(64));
+        v.window_corner_radius = CornerRadius::same(10);
+        v.menu_corner_radius = CornerRadius::same(8);
+        v.window_shadow = Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(110) };
+        v.popup_shadow = Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(100) };
+        v.selection.bg_fill = Color32::from_rgb(40, 100, 125);
+        v.selection.stroke = Stroke::new(1.0_f32, accent);
+        v.hyperlink_color = accent;
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.corner_radius = CornerRadius::same(6);
+        }
+        v.widgets.inactive.bg_fill = Color32::from_rgb(48, 51, 61);
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(48, 51, 61);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(62, 67, 80);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(62, 67, 80);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
+        v.widgets.active.bg_fill = Color32::from_rgb(40, 100, 125);
+        v.widgets.active.weak_bg_fill = Color32::from_rgb(40, 100, 125);
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(10.0, 4.0);
+        s.spacing.window_margin = egui::Margin::same(12);
+    });
+}
+
+fn bar_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgb(28, 29, 35))
+        .inner_margin(egui::Margin::symmetric(12, 7))
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -1148,6 +1213,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             let (tx, rx) = mpsc::channel();
+            apply_theme(&cc.egui_ctx);
             let cmd = pw_backend::spawn(tx, cc.egui_ctx.clone());
             Ok(Box::new(RedoxRouter::new(rx, cmd)))
         }),

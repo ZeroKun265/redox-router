@@ -46,10 +46,12 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - [x] Saved links: links you create/take over are saved by node+port name in layout.json and auto-connected whenever both ends exist; "Saved links" window (pause/remove). Missing nodes are skipped. Duplicate node names use the oldest node. Engine tested, UI UNTESTED
 - [x] Setups as tabs (`setups.json`; old layout.json migrates into "Main"). Each setup = layout, rules, saved links. Click a tab to view it; "Make active" removes our links the new setup doesn't use and auto-connects its links (● = live). Right-click tab: Rename/Duplicate/Delete; "+" = new setup copying layout+rules without links. Inactive setups show and edit their own saved links (virtual, nothing live changes). List logic tested, UI UNTESTED
 - [ ] Setups: per-setup window/pan, export/import a setup
-- [ ] Text comments
-- [ ] Translucent colored comment blocks
+- [x] Text comments: right-click empty canvas -> Add comment; drag, double-click to edit, drag right edge for width, right-click for color/delete (saved per setup; UNTESTED)
+- [x] Translucent colored blocks with a title bar (drag the bar, resize with the corner grip, right-click for edit/color/delete; drawn behind links and nodes; UNTESTED)
 - [ ] Cables as splines
-- [ ] Cables as user-drawn horizontal/vertical segments
+- [x] Zigzag cables (horizontal/vertical segments, rounded corners) via the top-bar style menu, saved per setup (math tested, UI UNTESTED)
+- [x] Cable waypoints: double-click one of your links to add a point, drag to move, double-click a point to remove; saved per link; works for curved and zigzag (UNTESTED)
+- [x] Box select (Shift+drag, Ctrl adds) with bottom-right All/Nodes/Links switch; selected nodes move together, Delete removes selected links; external links are not box-selectable (UNTESTED)
 
 ## Ideas / later
 - Tray icon (StatusNotifier); close window = hide, Quit = drop owned links. Some desktops need an extension for tray icons.
@@ -64,3 +66,7 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - Multiple setups as tabs (each: own canvas, rules, links), with a "make active" button. Plan: switch in-process (no app restart): destroy current owned links, create the setup's links (stored by node/port names), auto-connect as nodes appear.
 - [x] Rule match modes: contains/wildcards, exact match, is empty (blank/whitespace) on any field (engine tested, UI UNTESTED)
 - [x] "Reset all settings…" button (confirmation; clears setups, links, rules, library, layout; UNTESTED)
+- [x] UI theme refresh: darker rounded panels and widgets, teal accent, dot-grid canvas, node shadows/gloss, glowing links, ringed ports (apply_theme in main.rs; UNTESTED visually)
+- [x] Animated flowing dots on links, glow on external links too; nickname tab drawn behind its node (fused look)
+- [x] Markdown in comments (headings, bullets, bold, italic, code, strike; custom subset parser, tested; rendering UNTESTED). Bold is shown as brighter text with wider letters since egui has no bold font
+- [x] Double-click a block title = select the nodes fully inside; dragging the title then moves them too. Rename a block via right-click > Edit text

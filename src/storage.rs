@@ -50,6 +50,32 @@ pub struct LayoutFile {
     /// Deprecated legacy field; migrated to sink_hide_mode if true.
     #[serde(default, skip_serializing)]
     pub hide_all_sinks: bool,
+    /// Comments and colored blocks.
+    #[serde(default)]
+    pub notes: Vec<Note>,
+    /// Curved or zigzag cables.
+    #[serde(default)]
+    pub link_style: crate::layout::LinkStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteKind {
+    /// Sticky text comment (drawn above nodes).
+    Text,
+    /// Translucent colored block with a title (drawn behind everything).
+    Block,
+}
+
+/// A text comment or colored block on the canvas (world coordinates).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    pub id: u64,
+    pub kind: NoteKind,
+    pub pos: (f32, f32),
+    /// Width and height; a comment's height follows its text.
+    pub size: (f32, f32),
+    pub text: String,
+    pub color: [u8; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +147,8 @@ impl Default for LayoutFile {
             sink_hide_mode: SinkHideMode::ShowAll,
             auto_connect_prevention: AutoConnectPrevention::Off,
             hide_all_sinks: false,
+            notes: Vec::new(),
+            link_style: Default::default(),
         }
     }
 }

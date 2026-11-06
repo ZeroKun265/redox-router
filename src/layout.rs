@@ -21,6 +21,83 @@ pub const MAX_ZOOM: f32 = 4.0;
 
 pub type P = (f32, f32);
 
+use serde::{Deserialize, Serialize};
+
+/// How cables are drawn between ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LinkStyle {
+    #[default]
+    Curved,
+    /// Horizontal and vertical segments with rounded corners.
+    Zigzag,
+}
+
+impl LinkStyle {
+    pub const ALL: [LinkStyle; 2] = [LinkStyle::Curved, LinkStyle::Zigzag];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LinkStyle::Curved => "Curved cables",
+            LinkStyle::Zigzag => "Zigzag cables",
+        }
+    }
+}
+
+/// Corner points of a horizontal/vertical cable from output `a` (leaves to the
+/// right) to input `b` (enters from the left). `stub` is the minimum straight
+/// piece next to a port; `lane` shifts the middle segment so cables between the
+/// same nodes do not lie exactly on top of each other.
+pub fn zigzag_points(a: P, b: P, stub: f32, lane: f32) -> Vec<P> {
+    let mut v = vec![a];
+    if b.0 - a.0 >= 2.0 * stub {
+        let xm = ((a.0 + b.0) / 2.0 + lane).clamp(a.0 + stub, b.0 - stub);
+        v.push((xm, a.1));
+        v.push((xm, b.1));
+    } else {
+        // Input is left of (or just right of) the output: go around.
+        let (x1, x2) = (a.0 + stub, b.0 - stub);
+        let mut ym = (a.1 + b.1) / 2.0 + lane;
+        if (a.1 - b.1).abs() < stub {
+            ym = a.1.max(b.1) + stub * 2.0 + lane.abs();
+        }
+        v.extend([(x1, a.1), (x1, ym), (x2, ym), (x2, b.1)]);
+    }
+    v.push(b);
+    v.dedup_by(|p, q| (p.0 - q.0).abs() < 1e-3 && (p.1 - q.1).abs() < 1e-3);
+    v
+}
+
+/// Round the corners of a polyline with quadratic curves (`radius` is capped at
+/// half of each adjacent segment). First and last point are kept.
+pub fn round_corners(pts: &[P], radius: f32, segs: usize) -> Vec<P> {
+    if pts.len() < 3 || radius <= 0.0 {
+        return pts.to_vec();
+    }
+    let len = |p: P, q: P| ((q.0 - p.0).powi(2) + (q.1 - p.1).powi(2)).sqrt();
+    let mut out = vec![pts[0]];
+    for w in pts.windows(3) {
+        let (p, c, n) = (w[0], w[1], w[2]);
+        let (l1, l2) = (len(p, c), len(c, n));
+        if l1 < 1e-3 || l2 < 1e-3 {
+            out.push(c);
+            continue;
+        }
+        let r = radius.min(l1 / 2.0).min(l2 / 2.0);
+        let s = (c.0 + (p.0 - c.0) / l1 * r, c.1 + (p.1 - c.1) / l1 * r);
+        let e = (c.0 + (n.0 - c.0) / l2 * r, c.1 + (n.1 - c.1) / l2 * r);
+        for i in 0..=segs {
+            let t = i as f32 / segs as f32;
+            let u = 1.0 - t;
+            out.push((
+                u * u * s.0 + 2.0 * u * t * c.0 + t * t * e.0,
+                u * u * s.1 + 2.0 * u * t * c.1 + t * t * e.1,
+            ));
+        }
+    }
+    out.push(pts[pts.len() - 1]);
+    out
+}
+
 use std::collections::HashMap;
 
 /// Try to make node `id` the holder of saved-position `key`. Several live nodes
@@ -212,6 +289,46 @@ mod tests {
         assert_eq!(z, MAX_ZOOM);
         let (_, z) = zoom_about((0.0, 0.0), 1.0, (0.0, 0.0), 0.0001);
         assert_eq!(z, MIN_ZOOM);
+    }
+
+    #[test]
+    fn zigzag_forward_is_axis_aligned_and_keeps_ends() {
+        let v = zigzag_points((0.0, 0.0), (200.0, 80.0), 20.0, 0.0);
+        assert_eq!(v, vec![(0.0, 0.0), (100.0, 0.0), (100.0, 80.0), (200.0, 80.0)]);
+        // The lane moves the middle segment but never into the stubs.
+        let v = zigzag_points((0.0, 0.0), (200.0, 80.0), 20.0, 500.0);
+        assert_eq!(v[1].0, 180.0);
+        let v = zigzag_points((0.0, 0.0), (200.0, 80.0), 20.0, -500.0);
+        assert_eq!(v[1].0, 20.0);
+    }
+
+    #[test]
+    fn zigzag_backward_goes_around() {
+        let v = zigzag_points((300.0, 0.0), (100.0, 100.0), 20.0, 0.0);
+        assert_eq!(v.first(), Some(&(300.0, 0.0)));
+        assert_eq!(v.last(), Some(&(100.0, 100.0)));
+        assert_eq!(v[1], (320.0, 0.0)); // leaves to the right
+        assert_eq!(v[v.len() - 2], (80.0, 100.0)); // enters from the left
+        for w in v.windows(2) {
+            assert!(w[0].0 == w[1].0 || w[0].1 == w[1].1, "segment not axis aligned");
+        }
+        // Same height: detours below instead of running through the nodes.
+        let v = zigzag_points((300.0, 50.0), (100.0, 50.0), 20.0, 0.0);
+        assert!(v.iter().any(|p| p.1 > 50.0));
+    }
+
+    #[test]
+    fn rounded_corners_keep_endpoints_and_stay_inside() {
+        let v = zigzag_points((0.0, 0.0), (200.0, 80.0), 20.0, 0.0);
+        let r = round_corners(&v, 15.0, 6);
+        assert_eq!(r.first(), v.first());
+        assert_eq!(r.last(), v.last());
+        assert!(r.len() > v.len());
+        assert!(r.iter().all(|p| p.0 >= 0.0 && p.0 <= 200.0 && p.1 >= 0.0 && p.1 <= 80.0));
+        // Too short segments cap the radius instead of overshooting.
+        let tiny = round_corners(&[(0.0, 0.0), (10.0, 0.0), (10.0, 4.0)], 50.0, 4);
+        assert!(tiny.iter().all(|p| p.0 <= 10.0 + 1e-3 && p.1 >= -1e-3 && p.1 <= 4.0 + 1e-3));
+        assert_eq!(round_corners(&[(0.0, 0.0), (1.0, 1.0)], 5.0, 4).len(), 2);
     }
 
     #[test]
