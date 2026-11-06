@@ -2,6 +2,8 @@
 //! every session), pan and zoom. Stored as JSON in the user's config dir,
 //! e.g. ~/.config/RedoxRouter/layout.json on Linux.
 
+use crate::links::SavedLink;
+use crate::setups::SetupList;
 use crate::rules::{GroupEntry, Rule, RuleGroup};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,72 @@ pub struct LayoutFile {
     /// Rule groups (own or library references), applied in order.
     #[serde(default)]
     pub groups: Vec<GroupEntry>,
+    /// Saved connections (by node/port name), re-created when both ends exist.
+    #[serde(default)]
+    pub links: Vec<SavedLink>,
+    /// Mode for hiding sink nodes: ShowAll, HideRedox, or HideAll.
+    #[serde(default)]
+    pub sink_hide_mode: SinkHideMode,
+    /// Audio bleed / auto-connection prevention mode.
+    #[serde(default)]
+    pub auto_connect_prevention: AutoConnectPrevention,
+    /// Deprecated legacy field; migrated to sink_hide_mode if true.
+    #[serde(default, skip_serializing)]
+    pub hide_all_sinks: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSink {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AutoConnectPrevention {
+    #[default]
+    Off,
+    ManagedNodes,
+    AllNodes,
+}
+
+impl AutoConnectPrevention {
+    pub const ALL: [AutoConnectPrevention; 3] = [
+        AutoConnectPrevention::Off,
+        AutoConnectPrevention::ManagedNodes,
+        AutoConnectPrevention::AllNodes,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AutoConnectPrevention::Off => "Allow all",
+            AutoConnectPrevention::ManagedNodes => "Block for managed nodes",
+            AutoConnectPrevention::AllNodes => "Block for all new apps",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SinkHideMode {
+    #[default]
+    ShowAll,
+    HideRedox,
+    HideAll,
+}
+
+impl SinkHideMode {
+    pub const ALL: [SinkHideMode; 3] = [
+        SinkHideMode::ShowAll,
+        SinkHideMode::HideRedox,
+        SinkHideMode::HideAll,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SinkHideMode::ShowAll => "Show all",
+            SinkHideMode::HideRedox => "Hide Redox only",
+            SinkHideMode::HideAll => "Hide all",
+        }
+    }
 }
 
 impl Default for LayoutFile {
@@ -49,6 +117,10 @@ impl Default for LayoutFile {
             nicknames: BTreeMap::new(),
             rules: Vec::new(),
             groups: Vec::new(),
+            links: Vec::new(),
+            sink_hide_mode: SinkHideMode::ShowAll,
+            auto_connect_prevention: AutoConnectPrevention::Off,
+            hide_all_sinks: false,
         }
     }
 }
@@ -78,8 +150,16 @@ pub fn load() -> Option<LayoutFile> {
     load_json("layout.json")
 }
 
-pub fn save(layout: &LayoutFile) -> Result<(), String> {
-    save_json("layout.json", layout)
+/// All setups. The first run migrates the old single `layout.json` into "Main".
+pub fn load_setups() -> SetupList<LayoutFile> {
+    let mut l: SetupList<LayoutFile> = load_json("setups.json")
+        .unwrap_or_else(|| SetupList::new("Main", load().unwrap_or_default()));
+    l.fix(LayoutFile::default);
+    l
+}
+
+pub fn save_setups(setups: &SetupList<LayoutFile>) -> Result<(), String> {
+    save_json("setups.json", setups)
 }
 
 /// The shared rule library (used by every setup).
@@ -89,4 +169,13 @@ pub fn load_library() -> Vec<RuleGroup> {
 
 pub fn save_library(library: &[RuleGroup]) -> Result<(), String> {
     save_json("rule_library.json", &library)
+}
+
+/// Persistent Redox-created virtual sinks.
+pub fn load_sinks() -> Vec<SavedSink> {
+    load_json("sinks.json").unwrap_or_default()
+}
+
+pub fn save_sinks(sinks: &[SavedSink]) -> Result<(), String> {
+    save_json("sinks.json", &sinks)
 }

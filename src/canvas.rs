@@ -5,7 +5,7 @@
 //! can be deleted. External links (made by other programs) are hidden unless
 //! `show_external` is on or the pair is in `revealed`, and are read-only.
 
-use crate::graph::{Direction, Graph, NodeInfo, PortInfo, RouteRef};
+use crate::graph::{Direction, Graph, NodeInfo, PortInfo};
 use crate::layout::{self, Placer, HEADER_H};
 use crate::volume;
 use std::collections::BTreeMap;
@@ -22,9 +22,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 pub enum Action {
     Connect { out_port: u32, in_port: u32 },
     Disconnect { out_port: u32, in_port: u32 },
-    /// `route`: set the sound card's route volume instead of the node's own.
-    SetVolume { node_id: u32, linear: f32, channels: usize, route: Option<RouteRef> },
-    SetMute { node_id: u32, mute: bool, route: Option<RouteRef> },
+    SetVolume { node_id: u32, linear: f32, channels: usize },
+    SetMute { node_id: u32, mute: bool },
+    DestroySink { node_id: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +34,10 @@ struct Pending {
 }
 
 pub struct Canvas {
+    /// Saved links (by name); filled by the app, persisted with the layout.
+    pub links: Vec<crate::links::SavedLink>,
+    /// Viewing an inactive setup: draw and edit its saved links instead of the live ones.
+    pub virtual_mode: bool,
     /// Screen offset of the world origin, relative to the canvas top-left.
     pan: Vec2,
     zoom: f32,
@@ -64,6 +68,10 @@ pub struct Canvas {
     /// Selected link as (out_port, in_port).
     selected: Option<(u32, u32)>,
     pub show_external: bool,
+    /// Mode for hiding sink nodes: ShowAll, HideRedox, or HideAll.
+    pub sink_hide_mode: crate::storage::SinkHideMode,
+    /// Audio bleed / auto-connection prevention mode.
+    pub auto_connect_prevention: crate::storage::AutoConnectPrevention,
     /// External links the user chose to show individually ("visible only").
     pub revealed: HashSet<(u32, u32)>,
 }
@@ -71,6 +79,8 @@ pub struct Canvas {
 impl Default for Canvas {
     fn default() -> Self {
         Self {
+            links: Vec::new(),
+            virtual_mode: false,
             pan: vec2(20.0, 20.0),
             zoom: 1.0,
             pos: HashMap::new(),
@@ -89,6 +99,8 @@ impl Default for Canvas {
             pending: None,
             selected: None,
             show_external: false,
+            sink_hide_mode: crate::storage::SinkHideMode::ShowAll,
+            auto_connect_prevention: crate::storage::AutoConnectPrevention::Off,
             revealed: HashSet::new(),
         }
     }
@@ -146,6 +158,13 @@ impl Canvas {
             let group = RuleGroup { name: "Rules".to_string(), enabled: true, rules: f.rules };
             groups.insert(0, GroupEntry::Local(group));
         }
+        let sink_hide_mode = if f.sink_hide_mode != crate::storage::SinkHideMode::ShowAll {
+            f.sink_hide_mode
+        } else if f.hide_all_sinks {
+            crate::storage::SinkHideMode::HideAll
+        } else {
+            f.sink_hide_mode
+        };
         Self {
             pan: vec2(f.pan.0, f.pan.1),
             zoom: f.zoom.clamp(layout::MIN_ZOOM, layout::MAX_ZOOM),
@@ -153,6 +172,9 @@ impl Canvas {
             hidden: f.hidden,
             saved_w: f.widths.into_iter().collect(),
             nicknames: f.nicknames,
+            links: f.links,
+            sink_hide_mode,
+            auto_connect_prevention: f.auto_connect_prevention,
             rules: RuleSet { groups, ..RuleSet::default() },
             ..Self::default()
         }
@@ -168,6 +190,10 @@ impl Canvas {
             nicknames: self.nicknames.clone(),
             rules: Vec::new(),
             groups: self.rules.groups.clone(),
+            links: self.links.clone(),
+            sink_hide_mode: self.sink_hide_mode,
+            auto_connect_prevention: self.auto_connect_prevention,
+            hide_all_sinks: self.sink_hide_mode == crate::storage::SinkHideMode::HideAll,
         }
     }
 
@@ -178,6 +204,9 @@ impl Canvas {
 
     pub fn unhide(&mut self, name: &str) {
         self.hidden.remove(name);
+        if let Some((bare, _)) = name.split_once('|') {
+            self.hidden.remove(bare);
+        }
         self.dirty = true;
     }
 
@@ -273,18 +302,30 @@ impl Canvas {
         let mut color_set: Vec<(String, [u8; 3])> = Vec::new();
         let mut color_clear: Vec<String> = Vec::new();
         for node in g.nodes.values() {
-            let key = (!node.name.is_empty()).then_some(node.name.as_str());
-            if key.is_some_and(|k| self.hidden.contains(k)) {
+            let key = (!node.name.is_empty()).then(|| node.key());
+            if key.as_ref().is_some_and(|k| self.hidden.contains(k) || self.hidden.contains(&node.name)) {
                 continue;
             }
+            let nickname = self
+                .nicknames
+                .get(&node.key())
+                .or_else(|| self.nicknames.get(&node.name))
+                .map_or("", |s| s.as_str());
             let text = rules::NodeText {
                 title: node.label(),
-                nickname: self.nicknames.get(&node.name).map_or("", |s| s.as_str()),
+                nickname,
                 name: &node.name,
                 description: &node.description,
                 media_class: &node.media_class,
             };
-            let outcome = rules::evaluate(self.rules.active_rules(), &text);
+            let is_sink = node.is_sink();
+            let is_redox = g.is_node_owned(node);
+            let default_hidden = match self.sink_hide_mode {
+                crate::storage::SinkHideMode::ShowAll => false,
+                crate::storage::SinkHideMode::HideRedox => is_sink && is_redox,
+                crate::storage::SinkHideMode::HideAll => is_sink,
+            };
+            let outcome = rules::evaluate(self.rules.active_rules(), &text, default_hidden);
             if outcome.hidden {
                 continue;
             }
@@ -302,10 +343,10 @@ impl Canvas {
                 widest(&ins),
                 widest(&outs),
             );
-            // A manual width (saved by name) overrides the automatic one.
+            // A manual width (saved by name/key) overrides the automatic one.
             if !self.width.contains_key(&node.id) {
-                if let Some(k) = key {
-                    if let Some(&sw) = self.saved_w.get(k) {
+                if let Some(ref k) = key {
+                    if let Some(&sw) = self.saved_w.get(k).or_else(|| self.saved_w.get(&node.name)) {
                         let alive = |id| g.nodes.contains_key(&id);
                         if layout::try_claim(&mut self.claimed, alive, k, node.id) {
                             self.width.insert(node.id, sw);
@@ -327,7 +368,7 @@ impl Canvas {
             let title_h = lay(node.label(), title_font.clone(), Color32::WHITE, w - 16.0).size().y;
             let header_h = (title_h + 10.0).max(HEADER_H);
             // Audio nodes get a volume slider row below their ports.
-            let has_vol = g.volume_target(node).is_some();
+            let has_vol = g.volume_of(node).is_some();
             let mut all_rows = row_h.clone();
             if has_vol {
                 all_rows.push(layout::VOL_ROW_H);
@@ -335,11 +376,11 @@ impl Canvas {
             let (h, centers) = layout::node_rows(header_h, &all_rows);
             let vol_y = has_vol.then(|| centers[row_h.len()]);
             let col = layout::column_for(&node.media_class);
-            // Saved nodes are matched by name (ids change between sessions).
+            // Saved nodes are matched by key (or legacy name; ids change between sessions).
             let mut p = match self.pos.get(&node.id) {
                 Some(&p) => p,
                 None => {
-                    let saved = key.and_then(|k| {
+                    let saved = key.as_ref().and_then(|k| {
                         layout::claim_saved(
                             &self.saved,
                             &mut self.claimed,
@@ -347,6 +388,15 @@ impl Canvas {
                             k,
                             node.id,
                         )
+                        .or_else(|| {
+                            layout::claim_saved(
+                                &self.saved,
+                                &mut self.claimed,
+                                |id| g.nodes.contains_key(&id),
+                                &node.name,
+                                node.id,
+                            )
+                        })
                     });
                     let p = saved.unwrap_or_else(|| self.placer.place(col, h));
                     self.pos.insert(node.id, p);
@@ -359,11 +409,17 @@ impl Canvas {
             if visible {
                 let id = ui.id().with(("node", node.id));
                 let resp = ui.interact(r, id, Sense::click_and_drag());
-                if let Some(k) = key {
+                if let Some(ref k) = key {
                     resp.context_menu(|ui| {
                         if ui.button("Hide node").clicked() {
-                            to_hide.push(k.to_string());
+                            to_hide.push(k.clone());
                             ui.close_menu();
+                        }
+                        if node.is_sink() {
+                            if ui.button("Destroy sink").clicked() {
+                                action = Some(Action::DestroySink { node_id: node.id });
+                                ui.close_menu();
+                            }
                         }
                         ui.menu_button("Color", |ui| {
                             ui.horizontal(|ui| {
@@ -373,13 +429,13 @@ impl Canvas {
                                     let fill = Color32::from_rgb(c[0], c[1], c[2]);
                                     ui.painter().rect_filled(sw, CornerRadius::same(3), fill);
                                     if sresp.clicked() {
-                                        color_set.push((k.to_string(), c));
+                                        color_set.push((k.clone(), c));
                                         ui.close_menu();
                                     }
                                 }
                             });
                             if ui.button("Reset color").clicked() {
-                                color_clear.push(k.to_string());
+                                color_clear.push(k.clone());
                                 ui.close_menu();
                             }
                         });
@@ -398,10 +454,10 @@ impl Canvas {
                     let d = resp.drag_delta() / z;
                     p = (p.0 + d.x, p.1 + d.y);
                     self.pos.insert(node.id, p);
-                    if let Some(k) = key {
+                    if let Some(ref k) = key {
                         let alive = |id| g.nodes.contains_key(&id);
                         if layout::try_claim(&mut self.claimed, alive, k, node.id) {
-                            self.saved.insert(k.to_string(), p);
+                            self.saved.insert(k.clone(), p);
                         }
                     }
                     r = to_rect(p, h, w);
@@ -437,17 +493,18 @@ impl Canvas {
                     let nw = (w + resp.drag_delta().x / z)
                         .clamp(layout::MIN_RESIZE_W, layout::MAX_RESIZE_W);
                     self.width.insert(node.id, nw);
-                    if let Some(k) = key {
+                    if let Some(ref k) = key {
                         let alive = |id| g.nodes.contains_key(&id);
                         if layout::try_claim(&mut self.claimed, alive, k, node.id) {
-                            self.saved_w.insert(k.to_string(), nw);
+                            self.saved_w.insert(k.clone(), nw);
                         }
                     }
                 }
                 if resp.double_clicked() {
                     self.width.remove(&node.id);
-                    if let Some(k) = key {
+                    if let Some(ref k) = key {
                         self.saved_w.remove(k);
+                        self.saved_w.remove(&node.name);
                     }
                     self.dirty = true;
                 }
@@ -495,13 +552,21 @@ impl Canvas {
 
         // Pass 2: links (under the nodes). External ones only when revealed.
         let mut shapes: Vec<((u32, u32), Vec<Pos2>)> = Vec::new();
-        for l in g.links.values() {
-            let pair = (l.out_port, l.in_port);
-            let owned = g.is_owned(l);
+        let pairs: Vec<((u32, u32), bool)> = if self.virtual_mode {
+            self.links
+                .iter()
+                .filter(|l| l.enabled)
+                .filter_map(|l| crate::links::resolve(g, l))
+                .map(|p| (p, true))
+                .collect()
+        } else {
+            g.links.values().map(|l| ((l.out_port, l.in_port), g.is_owned(l))).collect()
+        };
+        for (pair, owned) in pairs {
             if !(owned || self.show_external || self.revealed.contains(&pair)) {
                 continue;
             }
-            let (Some(a), Some(b)) = (anchors.get(&l.out_port), anchors.get(&l.in_port)) else {
+            let (Some(a), Some(b)) = (anchors.get(&pair.0), anchors.get(&pair.1)) else {
                 continue;
             };
             let pts: Vec<Pos2> = layout::bezier_points((a.x, a.y), (b.x, b.y), 24, 40.0 * z)
@@ -543,10 +608,12 @@ impl Canvas {
         if let Some(pair) = self.selected {
             // Forget the selection if the link is gone or no longer drawn
             // (e.g. one of its nodes was hidden).
-            if g.find_link(pair.0, pair.1).is_none() || !shapes.iter().any(|(p, _)| *p == pair) {
+            let gone = !self.virtual_mode && g.find_link(pair.0, pair.1).is_none();
+            if gone || !shapes.iter().any(|(p, _)| *p == pair) {
                 self.selected = None;
             } else if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-                let owned = g.find_link(pair.0, pair.1).is_some_and(|l| g.is_owned(l));
+                let owned = self.virtual_mode
+                    || g.find_link(pair.0, pair.1).is_some_and(|l| g.is_owned(l));
                 if owned {
                     action = Some(Action::Disconnect { out_port: pair.0, in_port: pair.1 });
                     self.selected = None;
@@ -612,8 +679,10 @@ impl Canvas {
 
             // Volume slider: drag or click the track; double-click = 100%;
             // click the percentage to mute.
-            if let (Some(cy), Some(target)) = (it.vol_y, g.volume_target(it.node)) {
-                let vol = target.vol;
+            if let (Some(cy), Some(vol)) = (it.vol_y, g.volume_of(it.node)) {
+                // Streams get a slider; devices (sound cards, virtual sinks) only a
+                // read-only bar, they are controlled by the system volume control.
+                let can_edit = it.node.is_stream();
                 let s = volume::linear_to_slider(vol.effective()).min(volume::SLIDER_MAX);
                 let top = r.min.y + (cy - layout::VOL_ROW_H / 2.0) * z;
                 let bottom = r.min.y + (cy + layout::VOL_ROW_H / 2.0) * z;
@@ -622,15 +691,19 @@ impl Canvas {
                     pos2(r.max.x - 56.0 * z, r.min.y + (cy + 3.0) * z),
                 );
                 let hit = track.expand2(vec2(6.0 * z, 7.0 * z));
-                let resp = ui.interact(hit, ui.id().with(("vol", it.node.id)), Sense::click_and_drag());
+                let sense = if can_edit { Sense::click_and_drag() } else { Sense::click() };
+                let resp = ui.interact(hit, ui.id().with(("vol", it.node.id)), sense);
+                if !can_edit {
+                    resp.clone().on_hover_text("Device volume: change it in your system volume control");
+                }
                 let mut new_s = None;
-                if resp.dragged() || resp.clicked() {
+                if can_edit && (resp.dragged() || resp.clicked()) {
                     if let Some(p) = resp.interact_pointer_pos() {
                         let t = ((p.x - track.min.x) / track.width()).clamp(0.0, 1.0);
                         new_s = Some(t * volume::SLIDER_MAX);
                     }
                 }
-                if resp.double_clicked() {
+                if can_edit && resp.double_clicked() {
                     new_s = Some(1.0);
                 }
                 if let Some(ns) = new_s.filter(|ns| (ns - s).abs() > 0.004) {
@@ -639,7 +712,6 @@ impl Canvas {
                             node_id: it.node.id,
                             linear: volume::slider_to_linear(ns),
                             channels: vol.channels.len(),
-                            route: target.route,
                         });
                     }
                 }
@@ -654,18 +726,20 @@ impl Canvas {
                 let filled =
                     Rect::from_min_max(track.min, pos2(track.min.x + track.width() * frac, track.max.y));
                 painter.rect_filled(filled, CornerRadius::same(3), fill_col);
-                painter.circle_filled(pos2(filled.max.x, track.center().y), 5.0 * z, Color32::from_gray(225));
+                if can_edit {
+                    painter.circle_filled(pos2(filled.max.x, track.center().y), 5.0 * z, Color32::from_gray(225));
+                }
 
                 let label = Rect::from_min_max(pos2(track.max.x + 8.0 * z, top), pos2(r.max.x - 4.0 * z, bottom));
                 let lresp = ui
                     .interact(label, ui.id().with(("mute", it.node.id)), Sense::click())
-                    .on_hover_text("Click to mute / unmute");
-                if lresp.clicked() && action.is_none() {
-                    action = Some(Action::SetMute {
-                        node_id: it.node.id,
-                        mute: !vol.mute,
-                        route: target.route,
+                    .on_hover_text(if can_edit {
+                        "Click to mute / unmute"
+                    } else {
+                        "Device volume: change it in your system volume control"
                     });
+                if can_edit && lresp.clicked() && action.is_none() {
+                    action = Some(Action::SetMute { node_id: it.node.id, mute: !vol.mute });
                 }
                 if show_text {
                     let text = if vol.mute { "muted".to_string() } else { format!("{}%", volume::percent(s)) };
@@ -683,7 +757,12 @@ impl Canvas {
 
             // Nickname tab above the top-left corner; click the pencil to rename.
             if !it.node.name.is_empty() {
-                let nick = self.nicknames.get(&it.node.name).cloned();
+                let nkey = it.node.key();
+                let nick = self
+                    .nicknames
+                    .get(&nkey)
+                    .or_else(|| self.nicknames.get(&it.node.name))
+                    .cloned();
                 let tab_h = layout::TAB_H * z;
                 let text_g = nick.as_ref().filter(|_| show_text).map(|n| {
                     painter.layout_no_wrap(n.clone(), FontId::proportional(11.0 * z), Color32::WHITE)
@@ -708,7 +787,7 @@ impl Canvas {
                 painter.line_segment([c + vec2(-3.5, 3.5) * z, c + vec2(3.0, -3.0) * z], ps);
                 painter.line_segment([c + vec2(-4.5, 5.5) * z, c + vec2(1.0, 5.5) * z], ps);
                 if resp.clicked() {
-                    self.editing = Some((it.node.name.clone(), tab.left_top()));
+                    self.editing = Some((nkey, tab.left_top()));
                     self.edit_buf = nick.unwrap_or_default();
                     self.edit_first = true;
                 }
@@ -759,6 +838,9 @@ impl Canvas {
                     let t = self.edit_buf.trim().to_string();
                     if t.is_empty() {
                         self.nicknames.remove(&name);
+                        if let Some((bare, _)) = name.split_once('|') {
+                            self.nicknames.remove(bare);
+                        }
                     } else {
                         self.nicknames.insert(name, t);
                     }

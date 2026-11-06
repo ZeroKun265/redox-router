@@ -19,6 +19,8 @@ pub struct NodeInfo {
     /// profile devices (route device) the node is.
     pub device_id: Option<u32>,
     pub profile_device: Option<u32>,
+    /// Created by RedoxRouter.
+    pub is_owned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,8 @@ pub enum Event {
     LinkAdded(LinkInfo),
     /// Any global object was removed; the graph drops it if it knows the id.
     Removed(u32),
+    /// RedoxRouter created a node (e.g. virtual sink).
+    OwnedNodeAdded(u32),
     /// RedoxRouter created a link between these ports. The registry event for
     /// the new link follows later; that link is then marked as ours.
     OwnedAdded { out_port: u32, in_port: u32 },
@@ -60,7 +64,6 @@ pub enum Event {
     RouteVolume {
         device_id: u32,
         route_device: u32,
-        route_index: u32,
         master: Option<f32>,
         channels: Option<Vec<f32>>,
         mute: Option<bool>,
@@ -72,21 +75,17 @@ pub enum Event {
 #[derive(Debug)]
 pub enum Command {
     CreateLink { out_node: u32, out_port: u32, in_node: u32, in_port: u32 },
-    DestroyLink { out_port: u32, in_port: u32 },
+    DestroyLink { link_id: Option<u32>, out_port: u32, in_port: u32 },
     /// Set the same linear gain on all `channels` channels (0 = master volume only).
     SetVolume { node_id: u32, linear: f32, channels: usize },
     SetMute { node_id: u32, mute: bool },
-    SetRouteVolume {
-        device_id: u32,
-        route_index: u32,
-        route_device: u32,
-        linear: f32,
-        channels: usize,
-    },
-    SetRouteMute { device_id: u32, route_index: u32, route_device: u32, mute: bool },
     /// Destroy another program's link (`link_id`) and create our own between
     /// the same ports.
     TakeOver { link_id: u32, out_node: u32, out_port: u32, in_node: u32, in_port: u32 },
+    /// Create a virtual null audio sink.
+    CreateSink { name: String, description: String },
+    /// Destroy a sink / node by its global ID.
+    DestroySink { node_id: u32 },
 }
 
 /// Property lookup, so parsing does not depend on the pipewire crate.
@@ -103,7 +102,19 @@ impl NodeInfo {
             media_class: get("media.class").unwrap_or_default(),
             device_id: get("device.id").and_then(|s| s.parse().ok()),
             profile_device: get("card.profile.device").and_then(|s| s.parse().ok()),
+            is_owned: get("redox.owned").as_deref() == Some("true"),
         }
+    }
+
+    /// Application streams can be controlled (volume slider); devices are
+    /// only displayed.
+    pub fn is_stream(&self) -> bool {
+        self.media_class.starts_with("Stream/")
+    }
+
+    /// True for audio, video, or MIDI sink nodes (e.g. "Audio/Sink").
+    pub fn is_sink(&self) -> bool {
+        self.media_class.to_lowercase().contains("sink")
     }
 
     /// Best human-readable label.
@@ -112,6 +123,17 @@ impl NodeInfo {
             &self.name
         } else {
             &self.description
+        }
+    }
+
+    /// Stable persistence key. Different streams from the same application
+    /// (e.g. Discord input vs output) can share `node.name` but have different
+    /// `media.class` (e.g. "Stream/Input/Audio" vs "Stream/Output/Audio").
+    pub fn key(&self) -> String {
+        if self.media_class.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}|{}", self.name, self.media_class)
         }
     }
 }
@@ -179,28 +201,6 @@ impl NodeVolume {
     }
 }
 
-/// Volume of a sound card route, and its index for setting it.
-#[derive(Debug, Clone)]
-pub struct RouteVolume {
-    pub index: u32,
-    pub vol: NodeVolume,
-}
-
-/// Where to send a volume change so it takes effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RouteRef {
-    pub device_id: u32,
-    pub index: u32,
-    pub device: u32,
-}
-
-pub struct VolumeTarget<'a> {
-    pub vol: &'a NodeVolume,
-    /// `Some` when the volume lives on the sound card's route, `None` for the
-    /// node's own volume (streams, virtual devices).
-    pub route: Option<RouteRef>,
-}
-
 #[derive(Default)]
 pub struct Graph {
     pub nodes: BTreeMap<u32, NodeInfo>,
@@ -212,17 +212,24 @@ pub struct Graph {
     /// (not ports) so that when we take over an external link, the removal of
     /// the old link with the same ports does not clear ownership of the new one.
     pub owned_ids: HashSet<u32>,
+    /// Ids of nodes created by RedoxRouter (e.g. virtual sinks).
+    pub owned_node_ids: HashSet<u32>,
     /// Volume of audio nodes whose Props we watch.
     pub volumes: BTreeMap<u32, NodeVolume>,
-    /// Route volumes by (device id, route device number).
-    pub routes: BTreeMap<(u32, u32), RouteVolume>,
+    /// Sound card route volumes (what the desktop mixer shows) by
+    /// (device id, route device number). Read-only: devices are controlled by
+    /// the system volume control, not by RedoxRouter.
+    pub routes: BTreeMap<(u32, u32), NodeVolume>,
     pub error: Option<String>,
 }
 
 impl Graph {
     pub fn apply(&mut self, ev: Event) {
         match ev {
-            Event::NodeAdded(n) => {
+            Event::NodeAdded(mut n) => {
+                if self.owned_node_ids.contains(&n.id) {
+                    n.is_owned = true;
+                }
                 self.nodes.insert(n.id, n);
             }
             Event::PortAdded(p) => {
@@ -236,6 +243,7 @@ impl Graph {
             }
             Event::Removed(id) => {
                 self.nodes.remove(&id);
+                self.owned_node_ids.remove(&id);
                 self.volumes.remove(&id);
                 self.routes.retain(|k, _| k.0 != id); // a device object went away
                 self.ports.remove(&id);
@@ -245,6 +253,12 @@ impl Graph {
                     }
                 }
             }
+            Event::OwnedNodeAdded(id) => {
+                self.owned_node_ids.insert(id);
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.is_owned = true;
+                }
+            }
             Event::OwnedAdded { out_port, in_port } => {
                 self.owned_pairs.insert((out_port, in_port));
             }
@@ -252,13 +266,12 @@ impl Graph {
                 let v = self.volumes.entry(node_id).or_insert_with(NodeVolume::new);
                 v.merge(master, channels, mute);
             }
-            Event::RouteVolume { device_id, route_device, route_index, master, channels, mute } => {
-                let r = self
+            Event::RouteVolume { device_id, route_device, master, channels, mute } => {
+                let v = self
                     .routes
                     .entry((device_id, route_device))
-                    .or_insert_with(|| RouteVolume { index: route_index, vol: NodeVolume::new() });
-                r.index = route_index;
-                r.vol.merge(master, channels, mute);
+                    .or_insert_with(NodeVolume::new);
+                v.merge(master, channels, mute);
             }
             Event::OwnedRemoved { out_port, in_port } => {
                 self.owned_pairs.remove(&(out_port, in_port));
@@ -267,20 +280,23 @@ impl Graph {
         }
     }
 
-    /// The volume to show and control for a node: its sound card route's volume
-    /// if it has one (what desktop mixers change), else its own volume.
-    pub fn volume_target(&self, node: &NodeInfo) -> Option<VolumeTarget<'_>> {
+    /// The volume to show for a node: its sound card route's volume if it has
+    /// one (what desktop mixers show), else its own volume.
+    pub fn volume_of(&self, node: &NodeInfo) -> Option<&NodeVolume> {
         if let (Some(device_id), Some(device)) = (node.device_id, node.profile_device) {
-            if let Some(r) = self.routes.get(&(device_id, device)) {
-                let route = RouteRef { device_id, index: r.index, device };
-                return Some(VolumeTarget { vol: &r.vol, route: Some(route) });
+            if let Some(v) = self.routes.get(&(device_id, device)) {
+                return Some(v);
             }
         }
-        self.volumes.get(&node.id).map(|vol| VolumeTarget { vol, route: None })
+        self.volumes.get(&node.id)
     }
 
     pub fn is_owned(&self, l: &LinkInfo) -> bool {
         self.owned_ids.contains(&l.id)
+    }
+
+    pub fn is_node_owned(&self, node: &NodeInfo) -> bool {
+        node.is_owned || self.owned_node_ids.contains(&node.id)
     }
 
     /// Existing link between exactly these two ports. Prefers our own link if
@@ -435,29 +451,31 @@ mod tests {
             media_class: "Audio/Sink".into(),
             device_id: Some(2),
             profile_device: Some(1),
+            is_owned: false,
         };
+        assert!(!node.is_stream());
         g.apply(Event::Volume { node_id: 7, master: None, channels: Some(vec![1.0, 1.0]), mute: None });
-        assert!(g.volume_target(&node).unwrap().route.is_none());
+        assert!((g.volume_of(&node).unwrap().effective() - 1.0).abs() < 1e-6);
 
         g.apply(Event::RouteVolume {
             device_id: 2,
             route_device: 1,
-            route_index: 5,
             master: None,
             channels: Some(vec![0.25, 0.25]),
-            mute: None,
+            mute: Some(true),
         });
-        let t = g.volume_target(&node).unwrap();
-        assert_eq!(t.route, Some(RouteRef { device_id: 2, index: 5, device: 1 }));
-        assert!((t.vol.effective() - 0.25).abs() < 1e-6);
+        let v = g.volume_of(&node).unwrap();
+        assert!((v.effective() - 0.25).abs() < 1e-6 && v.mute);
 
         // Another profile device on the same card keeps using its node volume.
         let other = NodeInfo { profile_device: Some(2), ..node.clone() };
-        assert!(g.volume_target(&other).unwrap().route.is_none());
+        assert!((g.volume_of(&other).unwrap().effective() - 1.0).abs() < 1e-6);
 
         // The card goes away: back to the node's own volume.
         g.apply(Event::Removed(2));
-        assert!(g.volume_target(&node).unwrap().route.is_none());
+        assert!((g.volume_of(&node).unwrap().effective() - 1.0).abs() < 1e-6);
+        let stream = NodeInfo { media_class: "Stream/Output/Audio".into(), ..node };
+        assert!(stream.is_stream());
     }
 
     #[test]
@@ -482,5 +500,41 @@ mod tests {
         g.apply(Event::Removed(10));
         assert!(g.ports_of(1, Direction::Out).is_empty());
         assert_eq!(g.ports.len(), 2);
+    }
+
+    #[test]
+    fn node_key_distinguishes_same_name_different_media_class() {
+        let discord_out = NodeInfo {
+            id: 95,
+            name: "WEBRTC VoiceEngine".into(),
+            description: "Discord Playback".into(),
+            media_class: "Stream/Output/Audio".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        let discord_in = NodeInfo {
+            id: 130,
+            name: "WEBRTC VoiceEngine".into(),
+            description: "Discord Capture".into(),
+            media_class: "Stream/Input/Audio".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        assert_ne!(discord_out.key(), discord_in.key());
+        assert_eq!(discord_out.key(), "WEBRTC VoiceEngine|Stream/Output/Audio");
+        assert_eq!(discord_in.key(), "WEBRTC VoiceEngine|Stream/Input/Audio");
+
+        let legacy_no_class = NodeInfo {
+            id: 1,
+            name: "simple".into(),
+            description: "".into(),
+            media_class: "".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        assert_eq!(legacy_no_class.key(), "simple");
     }
 }

@@ -11,7 +11,7 @@ use pipewire as pw;
 use pw::device::Device;
 use pw::link::Link;
 use pw::node::Node;
-use pw::proxy::Listener;
+use pw::proxy::{Listener, ProxyListener, ProxyT};
 use pw::spa::param::ParamType;
 use pw::spa::pod::deserialize::PodDeserializer;
 use pw::spa::pod::serialize::PodSerializer;
@@ -31,13 +31,9 @@ const PROP_VOLUME: u32 = 0x10003;
 const PROP_MUTE: u32 = 0x10004;
 const PROP_CHANNEL_VOLUMES: u32 = 0x10008;
 const TYPE_OBJECT_PROPS: u32 = 0x40002;
-const TYPE_OBJECT_PARAM_ROUTE: u32 = 0x40009;
 const PARAM_PROPS: u32 = 2;
-const PARAM_ROUTE: u32 = 13;
-const ROUTE_INDEX: u32 = 1;
 const ROUTE_DEVICE: u32 = 3;
 const ROUTE_PROPS: u32 = 10;
-const ROUTE_SAVE: u32 = 13;
 
 type VolumeFields = (Option<f32>, Option<Vec<f32>>, Option<bool>);
 
@@ -71,12 +67,11 @@ fn parse_props(node_id: u32, pod: &Pod) -> Option<Event> {
     Some(Event::Volume { node_id, master, channels, mute })
 }
 
-/// A device's Route param: which route it is and the volume in its props.
+/// A device's Route param: the volume in its props, and which route device it is.
 fn parse_route(device_id: u32, pod: &Pod) -> Option<Event> {
-    let (mut index, mut device, mut fields) = (None, None, None);
+    let (mut device, mut fields) = (None, None);
     for p in parse_object(pod)?.properties {
         match (p.key, p.value) {
-            (ROUTE_INDEX, Value::Int(i)) => index = Some(i as u32),
             (ROUTE_DEVICE, Value::Int(i)) => device = Some(i as u32),
             (ROUTE_PROPS, Value::Object(o)) => fields = Some(props_fields(o.properties)),
             _ => {}
@@ -86,14 +81,7 @@ fn parse_route(device_id: u32, pod: &Pod) -> Option<Event> {
     if master.is_none() && channels.is_none() && mute.is_none() {
         return None;
     }
-    Some(Event::RouteVolume {
-        device_id,
-        route_device: device?,
-        route_index: index?,
-        master,
-        channels,
-        mute,
-    })
+    Some(Event::RouteVolume { device_id, route_device: device?, master, channels, mute })
 }
 
 fn pod_bytes(obj: Object) -> Option<Vec<u8>> {
@@ -107,26 +95,6 @@ fn set_props(node: &Node, properties: Vec<Property>) {
     if let Some(bytes) = pod_bytes(obj) {
         if let Some(pod) = Pod::from_bytes(&bytes) {
             node.set_param(ParamType::Props, 0, pod);
-        }
-    }
-}
-
-/// Send a Route param (index, device, props) to a sound card device.
-fn set_route_props(device: &Device, index: u32, route_device: u32, properties: Vec<Property>) {
-    let props = Object { type_: TYPE_OBJECT_PROPS, id: PARAM_PROPS, properties };
-    let route = Object {
-        type_: TYPE_OBJECT_PARAM_ROUTE,
-        id: PARAM_ROUTE,
-        properties: vec![
-            Property::new(ROUTE_INDEX, Value::Int(index as i32)),
-            Property::new(ROUTE_DEVICE, Value::Int(route_device as i32)),
-            Property::new(ROUTE_PROPS, Value::Object(props)),
-            Property::new(ROUTE_SAVE, Value::Bool(true)),
-        ],
-    };
-    if let Some(bytes) = pod_bytes(route) {
-        if let Some(pod) = Pod::from_bytes(&bytes) {
-            device.set_param(ParamType::Route, 0, pod);
         }
     }
 }
@@ -156,6 +124,37 @@ pub fn spawn(tx: Sender<Event>, ctx: egui::Context) -> CommandSender {
     cmd_tx
 }
 
+fn debug_enabled() -> bool {
+    static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("REDOX_DEBUG").is_some() {
+            ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+macro_rules! rlog {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!("[REDOX] {}", format_args!($($arg)*));
+        }
+    };
+}
+
+struct OwnedLink {
+    link: Link,
+    global_id: Rc<RefCell<Option<u32>>>,
+    _listener: ProxyListener,
+}
+
+struct OwnedSink {
+    _node: Node,
+    global_id: Rc<RefCell<Option<u32>>>,
+    _listener: ProxyListener,
+}
+
 fn run(
     tx: &Sender<Event>,
     ctx: &egui::Context,
@@ -165,15 +164,22 @@ fn run(
     let context = pw::context::ContextRc::new(&main_loop, None)?;
     let core = context.connect_rc(None)?;
 
-    // Quit the loop if the connection to the daemon dies.
+    // Quit the loop only if the connection to the daemon dies.
     let main_loop_weak = main_loop.downgrade();
     let (tx_err, ctx_err) = (tx.clone(), ctx.clone());
     let _core_listener = core
         .add_listener_local()
         .error(move |id, _seq, res, message| {
-            let _ = tx_err.send(Event::Error(format!("pipewire error {id}/{res}: {message}")));
-            ctx_err.request_repaint();
-            if id == 0 {
+            rlog!("core error id={id} res={res}: {message}");
+            // -ENOENT (-2) happens benignly when an object disappears right as we bind or destroy it.
+            if res != -2 {
+                let _ = tx_err.send(Event::Error(format!("pipewire error {id}/{res}: {message}")));
+                ctx_err.request_repaint();
+            }
+            // Quit the loop only if the connection is dead (EPIPE = -32, ECONNRESET = -104).
+            // Do NOT quit on method/resource errors (e.g. -ENOENT = -2 for unknown resource).
+            if id == 0 && (res == -32 || res == -104) {
+                rlog!("fatal connection error, quitting main loop");
                 if let Some(main_loop) = main_loop_weak.upgrade() {
                     main_loop.quit();
                 }
@@ -189,12 +195,17 @@ fn run(
     let listeners: Rc<RefCell<HashMap<u32, Box<dyn Listener>>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
-    // Commands from the UI. We keep the proxies of links we created, keyed by
-    // (out_port, in_port); dropping them is not how links get destroyed.
-    let owned_links: Rc<RefCell<HashMap<(u32, u32), Link>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Commands from the UI. We keep the proxies and listeners of links we created, keyed by
+    // (out_port, in_port).
+    let owned_links: Rc<RefCell<HashMap<(u32, u32), OwnedLink>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    // Virtual sinks created by RedoxRouter (kept alive while running, destroyed on exit).
+    let owned_sinks: Rc<RefCell<Vec<OwnedSink>>> = Rc::new(RefCell::new(Vec::new()));
     let (core_cmd, registry_cmd) = (core.clone(), registry.clone());
     let (tx_cmd, ctx_cmd) = (tx.clone(), ctx.clone());
-    let (nodes_cmd, devices_cmd) = (nodes.clone(), devices.clone());
+    let nodes_cmd = nodes.clone();
+    let owned_links_cmd = owned_links.clone();
+    let owned_sinks_cmd = owned_sinks.clone();
     let _cmd_receiver = cmd_rx.attach(main_loop.loop_(), move |cmd| {
         let notify = |ev: Event| {
             let _ = tx_cmd.send(ev);
@@ -202,9 +213,11 @@ fn run(
         };
         let create = |out_node: u32, out_port: u32, in_node: u32, in_port: u32| {
             let key = (out_port, in_port);
-            if owned_links.borrow().contains_key(&key) {
+            if owned_links_cmd.borrow().contains_key(&key) {
+                rlog!("create link {:?}: already in owned_links", key);
                 return;
             }
+            rlog!("create link out_node={out_node} out_port={out_port} in_node={in_node} in_port={in_port}");
             let props = properties! {
                 "link.output.node" => out_node.to_string(),
                 "link.output.port" => out_port.to_string(),
@@ -214,10 +227,40 @@ fn run(
             };
             match core_cmd.create_object::<Link>("link-factory", &props) {
                 Ok(link) => {
-                    owned_links.borrow_mut().insert(key, link);
+                    let gid = Rc::new(RefCell::new(None));
+                    let gid_bound = gid.clone();
+                    let owned_links_weak = Rc::downgrade(&owned_links_cmd);
+                    let key_clone = key;
+
+                    let listener = link
+                        .upcast_ref()
+                        .add_listener_local()
+                        .bound(move |id| {
+                            rlog!("owned link {:?} bound to global id {id}", key_clone);
+                            *gid_bound.borrow_mut() = Some(id);
+                        })
+                        .removed(move || {
+                            rlog!("owned link {:?} proxy removed by server", key_clone);
+                            if let Some(links) = owned_links_weak.upgrade() {
+                                links.borrow_mut().remove(&key_clone);
+                            }
+                        })
+                        .register();
+
+                    owned_links_cmd.borrow_mut().insert(
+                        key,
+                        OwnedLink {
+                            link,
+                            global_id: gid,
+                            _listener: listener,
+                        },
+                    );
                     notify(Event::OwnedAdded { out_port, in_port });
                 }
-                Err(e) => notify(Event::Error(format!("could not create link: {e}"))),
+                Err(e) => {
+                    rlog!("create link failed: {e}");
+                    notify(Event::Error(format!("could not create link: {e}")));
+                }
             }
         };
         match cmd {
@@ -225,9 +268,7 @@ fn run(
                 create(out_node, out_port, in_node, in_port);
             }
             Command::TakeOver { link_id, out_node, out_port, in_node, in_port } => {
-                // Destroy the other program's link first, then create ours.
-                // Errors (e.g. missing permission) arrive through the core
-                // error listener above.
+                rlog!("take over link_id={link_id}");
                 let _ = registry_cmd.destroy_global(link_id);
                 create(out_node, out_port, in_node, in_port);
             }
@@ -235,7 +276,6 @@ fn run(
                 if let Some(node) = nodes_cmd.borrow().get(&node_id) {
                     let mut props = volume_props(linear, channels);
                     if channels > 0 {
-                        // Node volume = channel volumes, so keep the master at unity.
                         props.push(Property::new(PROP_VOLUME, Value::Float(1.0)));
                     }
                     set_props(node, props);
@@ -246,23 +286,71 @@ fn run(
                     set_props(node, vec![Property::new(PROP_MUTE, Value::Bool(mute))]);
                 }
             }
-            Command::SetRouteVolume { device_id, route_index, route_device, linear, channels } => {
-                if let Some(dev) = devices_cmd.borrow().get(&device_id) {
-                    set_route_props(dev, route_index, route_device, volume_props(linear, channels));
+            Command::DestroyLink { link_id, out_port, in_port } => {
+                rlog!("command DestroyLink link_id={:?} out_port={} in_port={}", link_id, out_port, in_port);
+                let removed = owned_links_cmd.borrow_mut().remove(&(out_port, in_port));
+                let id_to_destroy =
+                    link_id.or_else(|| removed.as_ref().and_then(|ol| *ol.global_id.borrow()));
+                if let Some(id) = id_to_destroy {
+                    rlog!("destroying link global id {id} via registry");
+                    let _ = registry_cmd.destroy_global(id);
+                } else if let Some(ol) = removed {
+                    rlog!("destroying unbound link proxy via core");
+                    let _ = core_cmd.destroy_object(ol.link);
+                }
+                notify(Event::OwnedRemoved { out_port, in_port });
+            }
+            Command::CreateSink { name, description } => {
+                rlog!("command CreateSink name={name} description={description}");
+                let props = properties! {
+                    "factory.name" => "support.null-audio-sink",
+                    "node.name" => name,
+                    "node.description" => description,
+                    "media.class" => "Audio/Sink",
+                    "audio.position" => "FL,FR",
+                    "object.linger" => "false",
+                    "redox.owned" => "true"
+                };
+                match core_cmd.create_object::<Node>("adapter", &props) {
+                    Ok(node) => {
+                        rlog!("created virtual sink node proxy, waiting for global bind");
+                        let gid = Rc::new(RefCell::new(None));
+                        let gid_bound = gid.clone();
+                        let tx_sink = tx_cmd.clone();
+                        let ctx_sink = ctx_cmd.clone();
+
+                        let listener = node
+                            .upcast_ref()
+                            .add_listener_local()
+                            .bound(move |id| {
+                                rlog!("owned sink bound to global id {id}");
+                                *gid_bound.borrow_mut() = Some(id);
+                                let _ = tx_sink.send(Event::OwnedNodeAdded(id));
+                                ctx_sink.request_repaint();
+                            })
+                            .removed(move || {
+                                rlog!("owned sink proxy removed by server");
+                            })
+                            .register();
+
+                        owned_sinks_cmd.borrow_mut().push(OwnedSink {
+                            _node: node,
+                            global_id: gid,
+                            _listener: listener,
+                        });
+                    }
+                    Err(e) => {
+                        rlog!("create sink failed: {e}");
+                        notify(Event::Error(format!("could not create sink: {e}")));
+                    }
                 }
             }
-            Command::SetRouteMute { device_id, route_index, route_device, mute } => {
-                if let Some(dev) = devices_cmd.borrow().get(&device_id) {
-                    let props = vec![Property::new(PROP_MUTE, Value::Bool(mute))];
-                    set_route_props(dev, route_index, route_device, props);
-                }
-            }
-            Command::DestroyLink { out_port, in_port } => {
-                let removed = owned_links.borrow_mut().remove(&(out_port, in_port));
-                if let Some(link) = removed {
-                    let _ = core_cmd.destroy_object(link);
-                    notify(Event::OwnedRemoved { out_port, in_port });
-                }
+            Command::DestroySink { node_id } => {
+                rlog!("command DestroySink node_id={node_id}");
+                owned_sinks_cmd.borrow_mut().retain(|os| {
+                    os.global_id.borrow().map_or(true, |gid| gid != node_id)
+                });
+                let _ = registry_cmd.destroy_global(node_id);
             }
         }
     });
@@ -273,6 +361,8 @@ fn run(
     let (nodes_add, listeners_add) = (nodes.clone(), listeners.clone());
     let (nodes_rm, listeners_rm) = (nodes.clone(), listeners.clone());
     let (devices_add, devices_rm) = (devices.clone(), devices.clone());
+    let owned_links_rm = owned_links.clone();
+    let owned_sinks_rm = owned_sinks.clone();
     let _registry_listener = registry
         .add_listener_local()
         .global(move |obj| {
@@ -284,6 +374,14 @@ fn run(
                 ObjectType::Link => LinkInfo::from_props(obj.id, &get).map(Event::LinkAdded),
                 _ => None,
             };
+            if let Some(ref ev) = event {
+                if let Event::LinkAdded(ref l) = ev {
+                    rlog!(
+                        "global link added: id={} out_node={} out_port={} in_node={} in_port={}",
+                        l.id, l.out_node, l.out_port, l.in_node, l.in_port
+                    );
+                }
+            }
             if let Some(event) = event {
                 let _ = tx_add.send(event);
                 ctx_add.request_repaint();
@@ -350,9 +448,26 @@ fn run(
             }
         })
         .global_remove(move |id| {
+            rlog!("global_remove id={id}");
             listeners_rm.borrow_mut().remove(&id);
             devices_rm.borrow_mut().remove(&id);
             nodes_rm.borrow_mut().remove(&id);
+            owned_links_rm.borrow_mut().retain(|k, ol| {
+                if ol.global_id.borrow().map_or(false, |gid| gid == id) {
+                    rlog!("owned_links dropping entry {:?} matching global id {id}", k);
+                    false
+                } else {
+                    true
+                }
+            });
+            owned_sinks_rm.borrow_mut().retain(|os| {
+                if os.global_id.borrow().map_or(false, |gid| gid == id) {
+                    rlog!("owned_sinks dropping entry matching global id {id}");
+                    false
+                } else {
+                    true
+                }
+            });
             let _ = tx_rm.send(Event::Removed(id));
             ctx_rm.request_repaint();
         })

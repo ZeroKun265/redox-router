@@ -48,12 +48,39 @@ impl Field {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Action {
     Hide,
+    Show,
     Color([u8; 3]),
+}
+
+/// How a rule compares its pattern with the node's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Mode {
+    /// Plain text matches anywhere; with `*` / `?` the whole text must match.
+    #[default]
+    Pattern,
+    /// The whole text equals the pattern (case-insensitive, no wildcards).
+    Exact,
+    /// The text is empty or only spaces; no pattern needed.
+    Empty,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::Pattern, Mode::Exact, Mode::Empty];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Pattern => "Contains / wildcards",
+            Mode::Exact => "Exact match",
+            Mode::Empty => "Is empty",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rule {
     pub field: Field,
+    #[serde(default)]
+    pub mode: Mode,
     pub pattern: String,
     pub action: Action,
     #[serde(default = "yes")]
@@ -120,10 +147,38 @@ fn text_matches(pattern: &str, text: &str) -> bool {
 
 impl Rule {
     pub fn new() -> Rule {
-        Rule { field: Field::Title, pattern: String::new(), action: Action::Hide, enabled: true }
+        Rule {
+            field: Field::Title,
+            mode: Mode::Pattern,
+            pattern: String::new(),
+            action: Action::Hide,
+            enabled: true,
+        }
+    }
+
+    /// The text(s) of the node this rule's field refers to.
+    fn texts<'a>(&self, t: &NodeText<'a>) -> Vec<&'a str> {
+        match self.field {
+            Field::Any => vec![t.title, t.nickname, t.name, t.description, t.media_class],
+            Field::Title => vec![t.title],
+            Field::Nickname => vec![t.nickname],
+            Field::Name | Field::NameExact => vec![t.name],
+            Field::Description => vec![t.description],
+            Field::MediaClass => vec![t.media_class],
+        }
     }
 
     pub fn matches(&self, t: &NodeText) -> bool {
+        match self.mode {
+            // Blank means empty or only spaces; with "any field", all of them.
+            Mode::Empty => return self.texts(t).iter().all(|s| s.trim().is_empty()),
+            Mode::Exact => {
+                let want = self.pattern.to_lowercase();
+                return !self.pattern.is_empty()
+                    && self.texts(t).iter().any(|s| s.to_lowercase() == want);
+            }
+            Mode::Pattern => {}
+        }
         if self.pattern.is_empty() {
             return false;
         }
@@ -139,7 +194,13 @@ impl Rule {
             Field::Title => hit(t.title),
             Field::Nickname => hit(t.nickname),
             Field::Name => hit(t.name),
-            Field::NameExact => t.name.eq_ignore_ascii_case(&self.pattern),
+            Field::NameExact => {
+                if let Some((n, mc)) = self.pattern.split_once('|') {
+                    t.name.eq_ignore_ascii_case(n) && t.media_class.eq_ignore_ascii_case(mc)
+                } else {
+                    t.name.eq_ignore_ascii_case(&self.pattern)
+                }
+            }
             Field::Description => hit(t.description),
             Field::MediaClass => class_matches(&self.pattern, t.media_class),
         }
@@ -152,16 +213,24 @@ pub struct Outcome {
     pub color: Option<[u8; 3]>,
 }
 
-/// Apply the enabled rules to a node: any matching Hide hides it, the first
-/// matching Color colors it.
-pub fn evaluate<'a>(rules: impl IntoIterator<Item = &'a Rule>, t: &NodeText) -> Outcome {
-    let mut out = Outcome::default();
+/// Apply the enabled rules to a node: Hide hides it, Show unhides it, and the
+/// first matching Color colors it. Rules execute top to bottom.
+pub fn evaluate<'a>(
+    rules: impl IntoIterator<Item = &'a Rule>,
+    t: &NodeText,
+    default_hidden: bool,
+) -> Outcome {
+    let mut out = Outcome {
+        hidden: default_hidden,
+        color: None,
+    };
     for r in rules.into_iter().filter(|r| r.enabled) {
         if !r.matches(t) {
             continue;
         }
         match r.action {
             Action::Hide => out.hidden = true,
+            Action::Show => out.hidden = false,
             Action::Color(c) => {
                 out.color.get_or_insert(c);
             }
@@ -266,6 +335,7 @@ impl RuleSet {
             }
             None => g.rules.push(Rule {
                 field: Field::NameExact,
+                mode: Mode::Pattern,
                 pattern: node_name.to_string(),
                 action: Action::Color(color),
                 enabled: true,
@@ -274,12 +344,13 @@ impl RuleSet {
     }
 
     pub fn clear_manual_color(&mut self, node_name: &str) {
+        let bare = node_name.split_once('|').map(|(n, _)| n);
         for e in &mut self.groups {
             if let GroupEntry::Local(g) = e {
                 if g.name == MANUAL_COLORS {
                     g.rules.retain(|r| {
                         !(r.field == Field::NameExact
-                            && r.pattern == node_name
+                            && (r.pattern == node_name || bare.is_some_and(|b| r.pattern == b))
                             && matches!(r.action, Action::Color(_)))
                     });
                 }
@@ -348,7 +419,7 @@ mod tests {
     use super::*;
 
     fn rule(field: Field, pattern: &str, action: Action) -> Rule {
-        Rule { field, pattern: pattern.to_string(), action, enabled: true }
+        Rule { field, mode: Mode::Pattern, pattern: pattern.to_string(), action, enabled: true }
     }
 
     fn t<'a>(title: &'a str, name: &'a str, description: &'a str, class: &'a str) -> NodeText<'a> {
@@ -399,7 +470,7 @@ mod tests {
             rules: vec![rule(Field::Title, "mic", Action::Color([1, 1, 1]))],
         }));
         let node = t("Studio mic", "alsa_input.a", "", "");
-        let color = |set: &RuleSet| evaluate(set.active_rules(), &node).color;
+        let color = |set: &RuleSet| evaluate(set.active_rules(), &node, false).color;
         assert_eq!(color(&set), Some([1, 1, 1]));
 
         set.set_manual_color("alsa_input.a", [9, 9, 9]);
@@ -416,6 +487,61 @@ mod tests {
 
         set.clear_manual_color("alsa_input.a");
         assert_eq!(color(&set), Some([1, 1, 1]));
+
+        // Composite key ("name|media_class") distinguishes nodes sharing a name.
+        let discord_out = t("WEBRTC VoiceEngine", "WEBRTC VoiceEngine", "", "Stream/Output/Audio");
+        let discord_in = t("WEBRTC VoiceEngine", "WEBRTC VoiceEngine", "", "Stream/Input/Audio");
+        set.set_manual_color("WEBRTC VoiceEngine|Stream/Output/Audio", [10, 20, 30]);
+        set.set_manual_color("WEBRTC VoiceEngine|Stream/Input/Audio", [40, 50, 60]);
+        assert_eq!(evaluate(set.active_rules(), &discord_out, false).color, Some([10, 20, 30]));
+        assert_eq!(evaluate(set.active_rules(), &discord_in, false).color, Some([40, 50, 60]));
+        set.clear_manual_color("WEBRTC VoiceEngine|Stream/Output/Audio");
+        assert_eq!(evaluate(set.active_rules(), &discord_out, false).color, None);
+        assert_eq!(evaluate(set.active_rules(), &discord_in, false).color, Some([40, 50, 60]));
+    }
+
+    fn rule_mode(field: Field, mode: Mode, pattern: &str) -> Rule {
+        Rule { mode, ..rule(field, pattern, Action::Hide) }
+    }
+
+    #[test]
+    fn exact_mode_matches_whole_text_only() {
+        let n = t("Midi-Bridge", "", "", "");
+        assert!(rule_mode(Field::Title, Mode::Exact, "midi-bridge").matches(&n));
+        assert!(!rule_mode(Field::Title, Mode::Exact, "midi").matches(&n));
+        assert!(!rule_mode(Field::Title, Mode::Exact, "Midi-Bridge 2").matches(&n));
+        // Wildcard characters are literal here.
+        assert!(!rule_mode(Field::Title, Mode::Exact, "Midi*").matches(&n));
+        assert!(rule_mode(Field::Title, Mode::Exact, "a*b").matches(&t("A*B", "", "", "")));
+        // Works on other fields and on "any field".
+        let m = t("x", "alsa_output.a", "Speaker", "Audio/Sink");
+        assert!(rule_mode(Field::Description, Mode::Exact, "speaker").matches(&m));
+        assert!(rule_mode(Field::Any, Mode::Exact, "Audio/Sink").matches(&m));
+        assert!(!rule_mode(Field::Name, Mode::Exact, "alsa_output").matches(&m));
+        // An empty pattern never matches by accident (use "Is empty" for that).
+        assert!(!rule_mode(Field::Title, Mode::Exact, "").matches(&t("", "", "", "")));
+    }
+
+    #[test]
+    fn empty_mode_finds_blank_fields() {
+        let blank = rule_mode(Field::Title, Mode::Empty, "");
+        assert!(blank.matches(&t("", "n", "d", "c")));
+        assert!(blank.matches(&t("   ", "n", "d", "c")));
+        assert!(!blank.matches(&t("x", "", "", "")));
+        // Nickname empty = node has no nickname.
+        let no_nick = rule_mode(Field::Nickname, Mode::Empty, "");
+        assert!(no_nick.matches(&t("x", "", "", "")));
+        let mut with_nick = t("x", "", "", "");
+        with_nick.nickname = "mic";
+        assert!(!no_nick.matches(&with_nick));
+        // "Any field" empty only when every field is blank.
+        let any = rule_mode(Field::Any, Mode::Empty, "");
+        assert!(any.matches(&t("", "", " ", "")));
+        assert!(!any.matches(&t("", "", "", "Audio/Sink")));
+        // Usable as a Hide rule through evaluate.
+        let o = evaluate(&[blank.clone()], &t("", "n", "", ""), false);
+        assert!(o.hidden);
+        assert!(!evaluate(&[blank], &t("ok", "", "", ""), false).hidden);
     }
 
     #[test]
@@ -473,11 +599,22 @@ mod tests {
             rule(Field::Title, "fire", red),
             rule(Field::Description, "private", Action::Hide),
         ];
-        let o = evaluate(&rules, &t("Firefox", "", "", ""));
+        let o = evaluate(&rules, &t("Firefox", "", "", ""), false);
         assert_eq!(o, Outcome { hidden: false, color: Some([0, 0, 255]) }); // first enabled color
-        let o = evaluate(&rules, &t("Firefox", "", "Private tab", ""));
+        let o = evaluate(&rules, &t("Firefox", "", "Private tab", ""), false);
         assert!(o.hidden && o.color.is_some());
-        assert_eq!(evaluate(&rules, &t("Other", "", "", "")), Outcome::default());
+        assert_eq!(evaluate(&rules, &t("Other", "", "", ""), false), Outcome::default());
+    }
+
+    #[test]
+    fn show_action_unhides_default_hidden_node() {
+        let rules = vec![rule(Field::MediaClass, "Audio/Sink", Action::Show)];
+        let sink = t("USB Audio", "alsa_output.usb", "", "Audio/Sink");
+        let other = t("Mic", "alsa_input.mic", "", "Audio/Source");
+        let o_sink = evaluate(&rules, &sink, true);
+        assert!(!o_sink.hidden);
+        let o_other = evaluate(&rules, &other, true);
+        assert!(o_other.hidden);
     }
 
     fn local(name: &str, rules: Vec<Rule>) -> GroupEntry {

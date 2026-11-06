@@ -36,12 +36,16 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - [x] Color rules, filter-based (header color via the Rules window, UNTESTED)
 - [x] Color a single node manually: right-click -> Color swatches / Reset color. Writes an exact-name rule into the first group "Manual colors" (shown in the Rules window; engine tested, menu UNTESTED)
 - [x] Volume sliders on audio nodes (Props via `set_param`; cubic curve 0-150%, double-click = 100%, click the % to mute; UNTESTED, math + state merge tested)
-- [x] Sound card volume: devices use their route volume (what the desktop applet changes); nodes without one use node volume (UNTESTED; state logic tested)
+- [x] Volume slider only on application streams. Devices (sinks/sources) show a read-only bar, using the sound card route volume when available so it matches the system applet; they are controlled by the system volume control (decision 2026-11-05, avoids duplicate control)
 - [ ] Volume: per-channel sliders, show both route (hardware) and node (software) volume if they differ
 - [ ] Virtual microphone sinks
-- [ ] Virtual speaker sinks
-- [ ] Save/load setups, resilient to missing nodes
-- [ ] Auto-connect nodes when they appear
+- [x] Virtual speaker sinks: "Create sink…" dialog (`support.null-audio-sink` via `adapter` factory, `object.linger: false`, `redox.owned: true`) and "Destroy sink" menu/context action; saved in `sinks.json` so Redox sinks are automatically recreated on startup and cleaned up when RedoxRouter exits
+- [x] Sink visibility modes (`Show all`, `Hide Redox only`, `Hide all`) + `Action::Show` in the rules engine to selectively unhide sinks via filter rules
+- [x] Audio bleed / auto-connection prevention (`Allow all`, `Block for managed nodes`, `Block for all new apps`) to automatically sever unwanted external/WirePlumber default links
+- [x] Composite node persistence key (`"{node.name}|{media.class}"`) so nodes sharing a technical name (e.g. Discord input vs output `WEBRTC VoiceEngine`) have independent positions, widths, nicknames, visibility, and manual colors
+- [x] Saved links: links you create/take over are saved by node+port name in layout.json and auto-connected whenever both ends exist; "Saved links" window (pause/remove). Missing nodes are skipped. Duplicate node names use the oldest node. Engine tested, UI UNTESTED
+- [x] Setups as tabs (`setups.json`; old layout.json migrates into "Main"). Each setup = layout, rules, saved links. Click a tab to view it; "Make active" removes our links the new setup doesn't use and auto-connects its links (● = live). Right-click tab: Rename/Duplicate/Delete; "+" = new setup copying layout+rules without links. Inactive setups show and edit their own saved links (virtual, nothing live changes). List logic tested, UI UNTESTED
+- [ ] Setups: per-setup window/pan, export/import a setup
 - [ ] Text comments
 - [ ] Translucent colored comment blocks
 - [ ] Cables as splines
@@ -58,3 +62,5 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - [ ] Rule library: import/export a group as a file, rename a library group
 - [ ] When saved setups exist: each setup stores its own group list (library references + local groups); layout.json is the only "setup" for now
 - Multiple setups as tabs (each: own canvas, rules, links), with a "make active" button. Plan: switch in-process (no app restart): destroy current owned links, create the setup's links (stored by node/port names), auto-connect as nodes appear.
+- [x] Rule match modes: contains/wildcards, exact match, is empty (blank/whitespace) on any field (engine tested, UI UNTESTED)
+- [x] "Reset all settings…" button (confirmation; clears setups, links, rules, library, layout; UNTESTED)
