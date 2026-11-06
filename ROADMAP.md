@@ -20,9 +20,9 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - [x] Drag port to port to create an owned link; click a link + Delete removes it (owned only) (UNTESTED)
 - [x] External links hidden by default; "Show external links" toggle; per-link "Show as visible only" via the already-connected prompt (UNTESTED)
 - [x] "Make Redox connection": from the already-connected prompt, or via the top-bar button when an external link is selected. Destroys the original (`registry.destroy_global`) and recreates it as ours (UNTESTED; may fail if PipeWire permissions deny destroying another client's link, error shows in the top bar)
-- [ ] Right-click menu on links (currently: click to select, then Delete or the top-bar button)
+- [x] Right-click menu on links: Add waypoint here, Clear waypoints, Keep after quit (`object.linger`), Delete link, Make Redox connection, Hide external link (UNTESTED)
 - [ ] Verify link creation really disappears on quit, and that port-to-port drag works on screen
-- [ ] Fit-to-view / zoom-to-fit button
+- [x] Fit-to-view / zoom-to-fit button (`Fit view` in top bar + `F` / `Home` hotkeys; math tested, UI UNTESTED)
 - [x] Save node positions, pan and zoom to `~/.config/RedoxRouter/layout.json` (keyed by node.name, kept for absent nodes, saved at most once per second; UNTESTED, `layout.rs` claim logic has a passing test)
 - [ ] Verify layout survives restart and an unplugged/replugged device
 - [ ] Place new (unsaved) nodes so they avoid overlapping saved ones
@@ -51,11 +51,20 @@ Legend: [x] done, [ ] todo. Add new tasks as we go.
 - [ ] Cables as splines
 - [x] Zigzag cables (horizontal/vertical segments, rounded corners) via the top-bar style menu, saved per setup (math tested, UI UNTESTED)
 - [x] Cable waypoints: double-click one of your links to add a point, drag to move, double-click a point to remove; saved per link; works for curved and zigzag (UNTESTED)
-- [x] Box select (Shift+drag, Ctrl adds) with bottom-right All/Nodes/Links switch; selected nodes move together, Delete removes selected links; external links are not box-selectable (UNTESTED)
+- [x] Box select (left-drag selects, Shift+left-drag/click adds to selection, Ctrl+left-drag draws a zoom-to-fit box, middle-mouse drag pans) with bottom-right All/Nodes/Links switch; selected nodes move together, Delete removes selected links; external links are not box-selectable (UNTESTED)
+- [x] Port connection ping animation: growing and fading rings in the target port's color when dragging a cable close enough to connect on release (UNTESTED)
+- [x] Inline switch cables: right-click an owned link -> "Make switch" adds a draggable on/off toggle switch box on the cable; switch cables are colored violet up to the switch and only colored/animated after the switch when ON; turning OFF severs the live PipeWire link while remembering the connection (math tested, UI UNTESTED)
+
+- [x] Per-setup virtual speaker sinks & virtual microphone sources (`LayoutFile::virtual_devices`, migrated from legacy `sinks.json`, automatically created/destroyed when switching active setups and exported/imported with setups; UNTESTED)
+- [x] Stereo quick-linking: Shift+drag between FL/FR (or L/R, 1/2, MONO) ports auto-connects the matching partner port; right-click node -> "Connect stereo to…" submenu connects all matching channel pairs in one click (engine tested, UI UNTESTED)
+- [x] Node Search & Jump (`Ctrl+F` or top-bar `Find`: filters visible nodes by nickname, title, technical name, or description; Enter/click centers & zooms canvas on node; UNTESTED)
+- [x] Interactive Minimap in bottom-left corner (shows blocks, nodes, and current viewport rectangle; click/drag pans the canvas; per-setup toggle in top bar; UNTESTED)
+- [x] Snap-to-Grid & Align/Distribute: per-setup `Snap` toggle snaps nodes, blocks, comments, waypoints, and switches to the 28 px grid; bottom-right toolbar + node right-click menu to Align Left, Align Top, Distribute Vertically, and Distribute Horizontally when 2+ nodes are selected (math tested, UI UNTESTED)
+- [x] CLI / Hotkey IPC via Unix domain socket (`$XDG_RUNTIME_DIR/redox-router.sock`): `--list-setups`, `--activate <NAME>`, `--next-setup`, `--prev-setup`, `--create-sink <NAME>`, `--create-mic <NAME>` (arg parser tested, socket + live switching UNTESTED)
 
 ## Ideas / later
 - Tray icon (StatusNotifier); close window = hide, Quit = drop owned links. Some desktops need an extension for tray icons.
-- Per-connection "keep after quit" flag (set object.linger on that link)
+- [x] Per-connection "keep after quit" flag (set `object.linger` on that link via link right-click menu; UNTESTED)
 - Prompt on connect is per port pair, not per node pair
 - [x] Tooltip on a node's title block with the technical name, class and id (UNTESTED)
 - [x] Nickname rule field (UNTESTED UI; engine tested)

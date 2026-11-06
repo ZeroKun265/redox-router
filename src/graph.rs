@@ -74,14 +74,14 @@ pub enum Event {
 /// UI -> PipeWire thread.
 #[derive(Debug)]
 pub enum Command {
-    CreateLink { out_node: u32, out_port: u32, in_node: u32, in_port: u32 },
+    CreateLink { out_node: u32, out_port: u32, in_node: u32, in_port: u32, lingering: bool },
     DestroyLink { link_id: Option<u32>, out_port: u32, in_port: u32 },
     /// Set the same linear gain on all `channels` channels (0 = master volume only).
     SetVolume { node_id: u32, linear: f32, channels: usize },
     SetMute { node_id: u32, mute: bool },
     /// Destroy another program's link (`link_id`) and create our own between
     /// the same ports.
-    TakeOver { link_id: u32, out_node: u32, out_port: u32, in_node: u32, in_port: u32 },
+    TakeOver { link_id: u32, out_node: u32, out_port: u32, in_node: u32, in_port: u32, lingering: bool },
     /// Create a virtual null audio sink (virtual speaker).
     CreateSink { name: String, description: String },
     /// Create a virtual audio source (virtual microphone).

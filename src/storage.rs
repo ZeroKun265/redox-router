@@ -14,6 +14,10 @@ fn one() -> f32 {
     1.0
 }
 
+fn yes_bool() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutFile {
     #[serde(default)]
@@ -59,6 +63,15 @@ pub struct LayoutFile {
     /// Whether external (non-Redox) links are shown on this setup's canvas.
     #[serde(default)]
     pub show_external: bool,
+    /// Virtual sinks and virtual microphones belonging to this setup.
+    #[serde(default)]
+    pub virtual_devices: Vec<SavedSink>,
+    /// Whether dragging nodes, blocks, comments, and waypoints snaps to the grid.
+    #[serde(default)]
+    pub snap_to_grid: bool,
+    /// Whether the corner minimap is shown on this setup.
+    #[serde(default = "yes_bool")]
+    pub show_minimap: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +177,9 @@ impl Default for LayoutFile {
             notes: Vec::new(),
             link_style: Default::default(),
             show_external: false,
+            virtual_devices: Vec::new(),
+            snap_to_grid: false,
+            show_minimap: true,
         }
     }
 }
@@ -193,11 +209,18 @@ pub fn load() -> Option<LayoutFile> {
     load_json("layout.json")
 }
 
-/// All setups. The first run migrates the old single `layout.json` into "Main".
+/// All setups. The first run migrates the old single `layout.json` into "Main",
+/// and migrates legacy `sinks.json` into the active setup's `virtual_devices`.
 pub fn load_setups() -> SetupList<LayoutFile> {
     let mut l: SetupList<LayoutFile> = load_json("setups.json")
         .unwrap_or_else(|| SetupList::new("Main", load().unwrap_or_default()));
     l.fix(LayoutFile::default);
+    if l.items.iter().all(|s| s.data.virtual_devices.is_empty()) {
+        let legacy = load_sinks();
+        if !legacy.is_empty() {
+            l.items[l.active].data.virtual_devices = legacy;
+        }
+    }
     l
 }
 

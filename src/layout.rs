@@ -18,6 +18,8 @@ pub const COL_PITCH: f32 = 340.0;
 pub const ROW_GAP: f32 = 20.0;
 pub const MIN_ZOOM: f32 = 0.2;
 pub const MAX_ZOOM: f32 = 4.0;
+/// Base grid spacing in world units (matches the dot grid step of 28.0).
+pub const GRID_STEP: f32 = 28.0;
 
 pub type P = (f32, f32);
 
@@ -227,6 +229,88 @@ pub fn dist_to_polyline(p: P, pts: &[P]) -> f32 {
         .fold(f32::INFINITY, f32::min)
 }
 
+/// Snap a world position `(x, y)` to the nearest multiple of `grid`.
+pub fn snap_pos(p: P, grid: f32) -> P {
+    if grid <= 0.0 {
+        return p;
+    }
+    ((p.0 / grid).round() * grid, (p.1 / grid).round() * grid)
+}
+
+/// Compute `(pan, zoom)` so the world bounding box `[min .. max]` fits centered inside
+/// `view_size` with `margin` pixels on each side.
+pub fn fit_to_view(min: P, max: P, view_size: P, margin: f32) -> (P, f32) {
+    let bw = (max.0 - min.0).max(1.0);
+    let bh = (max.1 - min.1).max(1.0);
+    let avail_w = (view_size.0 - 2.0 * margin).max(40.0);
+    let avail_h = (view_size.1 - 2.0 * margin).max(40.0);
+    let zoom = (avail_w / bw).min(avail_h / bh).clamp(MIN_ZOOM, 1.5);
+    let cx = (min.0 + max.0) * 0.5;
+    let cy = (min.1 + max.1) * 0.5;
+    let pan = (view_size.0 * 0.5 - cx * zoom, view_size.1 * 0.5 - cy * zoom);
+    (pan, zoom)
+}
+
+/// Align all items `(id, pos, size)` to the minimum X coordinate among them.
+pub fn align_left(items: &mut [(u32, P, P)]) {
+    let Some(min_x) = items.iter().map(|(_, p, _)| p.0).reduce(f32::min) else { return };
+    for (_, p, _) in items {
+        p.0 = min_x;
+    }
+}
+
+/// Align all items `(id, pos, size)` to the minimum Y coordinate among them.
+pub fn align_top(items: &mut [(u32, P, P)]) {
+    let Some(min_y) = items.iter().map(|(_, p, _)| p.1).reduce(f32::min) else { return };
+    for (_, p, _) in items {
+        p.1 = min_y;
+    }
+}
+
+/// Distribute items `(id, pos, size)` evenly vertically (sorted by current Y).
+pub fn distribute_vertical(items: &mut [(u32, P, P)]) {
+    if items.len() < 2 {
+        return;
+    }
+    items.sort_by(|a, b| a.1 .1.total_cmp(&b.1 .1).then_with(|| a.0.cmp(&b.0)));
+    let first_y = items.first().unwrap().1 .1;
+    let last_bottom = items.last().map(|(_, p, s)| p.1 + s.1).unwrap();
+    let total_h: f32 = items.iter().map(|(_, _, s)| s.1).sum();
+    let span = last_bottom - first_y;
+    let gap = if span > total_h && items.len() > 1 {
+        (span - total_h) / (items.len() - 1) as f32
+    } else {
+        ROW_GAP
+    };
+    let mut y = first_y;
+    for (_, p, s) in items.iter_mut() {
+        p.1 = y;
+        y += s.1 + gap;
+    }
+}
+
+/// Distribute items `(id, pos, size)` evenly horizontally (sorted by current X).
+pub fn distribute_horizontal(items: &mut [(u32, P, P)]) {
+    if items.len() < 2 {
+        return;
+    }
+    items.sort_by(|a, b| a.1 .0.total_cmp(&b.1 .0).then_with(|| a.0.cmp(&b.0)));
+    let first_x = items.first().unwrap().1 .0;
+    let last_right = items.last().map(|(_, p, s)| p.0 + s.0).unwrap();
+    let total_w: f32 = items.iter().map(|(_, _, s)| s.0).sum();
+    let span = last_right - first_x;
+    let gap = if span > total_w && items.len() > 1 {
+        (span - total_w) / (items.len() - 1) as f32
+    } else {
+        40.0
+    };
+    let mut x = first_x;
+    for (_, p, s) in items.iter_mut() {
+        p.0 = x;
+        x += s.0 + gap;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +452,32 @@ mod tests {
         // Once the owner is gone, the other node takes over the spot.
         let only_two = |id: u32| id == 2;
         assert_eq!(claim_saved(&saved, &mut claimed, only_two, "mic", 2), Some((5.0, 6.0)));
+    }
+
+    #[test]
+    fn snap_fit_and_align_distribute() {
+        assert_eq!(snap_pos((15.0, -13.0), 28.0), (28.0, -0.0));
+        assert_eq!(snap_pos((41.0, 55.0), 28.0), (28.0, 56.0));
+
+        let (pan, zoom) = fit_to_view((0.0, 0.0), (400.0, 200.0), (1000.0, 600.0), 50.0);
+        assert!(zoom >= MIN_ZOOM && zoom <= 1.5);
+        // Center of bounds (200, 100) maps to center of view (500, 300).
+        assert!(close(pan.0 + 200.0 * zoom, 500.0));
+        assert!(close(pan.1 + 100.0 * zoom, 300.0));
+
+        let mut items = vec![
+            (1, (100.0, 300.0), (200.0, 50.0)),
+            (2, (40.0, 100.0), (200.0, 50.0)),
+            (3, (80.0, 200.0), (200.0, 50.0)),
+        ];
+        align_left(&mut items);
+        assert!(items.iter().all(|(_, p, _)| p.0 == 40.0));
+        distribute_vertical(&mut items);
+        assert_eq!(items[0].0, 2);
+        assert_eq!(items[1].0, 3);
+        assert_eq!(items[2].0, 1);
+        assert!(close(items[0].1 .1, 100.0));
+        assert!(close(items[1].1 .1, 200.0));
+        assert!(close(items[2].1 .1, 300.0));
     }
 }

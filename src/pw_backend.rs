@@ -211,19 +211,20 @@ fn run(
             let _ = tx_cmd.send(ev);
             ctx_cmd.request_repaint();
         };
-        let create = |out_node: u32, out_port: u32, in_node: u32, in_port: u32| {
+        let create = |out_node: u32, out_port: u32, in_node: u32, in_port: u32, lingering: bool| {
             let key = (out_port, in_port);
             if owned_links_cmd.borrow().contains_key(&key) {
                 rlog!("create link {:?}: already in owned_links", key);
                 return;
             }
-            rlog!("create link out_node={out_node} out_port={out_port} in_node={in_node} in_port={in_port}");
+            let linger_str = if lingering { "true" } else { "false" };
+            rlog!("create link out_node={out_node} out_port={out_port} in_node={in_node} in_port={in_port} linger={linger_str}");
             let props = properties! {
                 "link.output.node" => out_node.to_string(),
                 "link.output.port" => out_port.to_string(),
                 "link.input.node" => in_node.to_string(),
                 "link.input.port" => in_port.to_string(),
-                "object.linger" => "false"
+                "object.linger" => linger_str
             };
             match core_cmd.create_object::<Link>("link-factory", &props) {
                 Ok(link) => {
@@ -264,13 +265,13 @@ fn run(
             }
         };
         match cmd {
-            Command::CreateLink { out_node, out_port, in_node, in_port } => {
-                create(out_node, out_port, in_node, in_port);
+            Command::CreateLink { out_node, out_port, in_node, in_port, lingering } => {
+                create(out_node, out_port, in_node, in_port, lingering);
             }
-            Command::TakeOver { link_id, out_node, out_port, in_node, in_port } => {
+            Command::TakeOver { link_id, out_node, out_port, in_node, in_port, lingering } => {
                 rlog!("take over link_id={link_id}");
                 let _ = registry_cmd.destroy_global(link_id);
-                create(out_node, out_port, in_node, in_port);
+                create(out_node, out_port, in_node, in_port, lingering);
             }
             Command::SetVolume { node_id, linear, channels } => {
                 if let Some(node) = nodes_cmd.borrow().get(&node_id) {

@@ -61,6 +61,9 @@ pub enum SelectMode {
 pub enum Action {
     Connect { out_port: u32, in_port: u32 },
     Disconnect { out_port: u32, in_port: u32 },
+    TakeOver { out_port: u32, in_port: u32 },
+    SetLinkLinger { out_port: u32, in_port: u32, lingering: bool },
+    SetLinkEnabled { out_port: u32, in_port: u32, enabled: bool },
     SetVolume { node_id: u32, linear: f32, channels: usize },
     SetMute { node_id: u32, mute: bool },
     DestroySink { node_id: u32 },
@@ -116,10 +119,22 @@ pub struct Canvas {
     box_links: HashSet<(u32, u32)>,
     sel_nodes: HashSet<u32>,
     sel_notes: HashSet<u64>,
-    /// Screen position where a Shift+drag box started.
-    box_start: Option<Pos2>,
+    /// Screen position where a left-drag box started, and whether Ctrl was held (zoom-to-box).
+    box_start: Option<(Pos2, bool)>,
     /// Links the user asked to delete with several selected; the app drains it.
     pub extra_disconnects: Vec<(u32, u32)>,
+    /// Extra links the user asked to connect (e.g. Shift+drag stereo pair or "Connect stereo to…").
+    pub extra_connects: Vec<(u32, u32)>,
+    /// Per-setup virtual sinks and microphones.
+    pub virtual_devices: Vec<crate::storage::SavedSink>,
+    /// Snap nodes, blocks, comments, and waypoints to the grid (or hold Ctrl).
+    pub snap_to_grid: bool,
+    /// Show the corner minimap.
+    pub show_minimap: bool,
+    /// Cached world dimensions `(w, h)` of visible nodes this frame, for fit-to-view and align/distribute.
+    node_sizes: HashMap<u32, (f32, f32)>,
+    /// Last canvas viewport size in screen pixels.
+    last_rect_size: Vec2,
     /// Comments and colored blocks.
     pub notes: Vec<Note>,
     note_edit: Option<u64>,
@@ -130,6 +145,8 @@ pub struct Canvas {
     note_buf: String,
     /// Screen position of the last right-click on empty canvas.
     ctx_pos: Option<Pos2>,
+    /// Link right-clicked on the canvas: `((out_port, in_port), click_pos, is_owned)`.
+    ctx_link: Option<((u32, u32), Pos2, bool)>,
     /// Audio bleed / auto-connection prevention mode.
     pub auto_connect_prevention: crate::storage::AutoConnectPrevention,
     /// External links the user chose to show individually ("visible only").
@@ -167,12 +184,19 @@ impl Default for Canvas {
             sel_notes: HashSet::new(),
             box_start: None,
             extra_disconnects: Vec::new(),
+            extra_connects: Vec::new(),
+            virtual_devices: Vec::new(),
+            snap_to_grid: false,
+            show_minimap: true,
+            node_sizes: HashMap::new(),
+            last_rect_size: vec2(1000.0, 700.0),
             notes: Vec::new(),
             note_edit: None,
             group_sel: None,
             note_edit_first: false,
             note_buf: String::new(),
             ctx_pos: None,
+            ctx_link: None,
             auto_connect_prevention: crate::storage::AutoConnectPrevention::Off,
             revealed: HashSet::new(),
         }
@@ -371,6 +395,35 @@ fn lighten(c: Color32) -> Color32 {
     Color32::from_rgb(up(c.r()), up(c.g()), up(c.b()))
 }
 
+/// Split a polyline at its arc-length midpoint into `(before, mid_point, after)`.
+fn split_polyline_mid(pts: &[Pos2]) -> (Vec<Pos2>, Pos2, Vec<Pos2>) {
+    if pts.is_empty() {
+        return (Vec::new(), pos2(0.0, 0.0), Vec::new());
+    }
+    if pts.len() == 1 {
+        return (vec![pts[0]], pts[0], vec![pts[0]]);
+    }
+    let total: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+    let half = total * 0.5;
+    let mut walked = 0.0_f32;
+    let mut before = vec![pts[0]];
+    for (idx, w) in pts.windows(2).enumerate() {
+        let seg = (w[1] - w[0]).length();
+        if walked + seg >= half && seg > 0.0 {
+            let t = ((half - walked) / seg).clamp(0.0, 1.0);
+            let mid = w[0] + (w[1] - w[0]) * t;
+            before.push(mid);
+            let mut after = vec![mid];
+            after.extend_from_slice(&pts[idx + 1..]);
+            return (before, mid, after);
+        }
+        walked += seg;
+        before.push(w[1]);
+    }
+    let last = *pts.last().unwrap();
+    (before, last, vec![last])
+}
+
 /// Returns (drag started, drag stopped) for the hit area around a port.
 fn port_interact(ui: &mut egui::Ui, port_id: u32, anchor: Pos2, z: f32) -> (bool, bool) {
     let size = Vec2::splat(14.0 * z.max(0.7));
@@ -379,7 +432,10 @@ fn port_interact(ui: &mut egui::Ui, port_id: u32, anchor: Pos2, z: f32) -> (bool
         ui.id().with(("port", port_id)),
         Sense::drag(),
     );
-    (resp.drag_started(), resp.drag_stopped())
+    (
+        resp.drag_started_by(egui::PointerButton::Primary),
+        resp.drag_stopped_by(egui::PointerButton::Primary),
+    )
 }
 
 impl Canvas {
@@ -409,6 +465,9 @@ impl Canvas {
             sink_hide_mode,
             link_style: f.link_style,
             show_external: f.show_external,
+            virtual_devices: f.virtual_devices,
+            snap_to_grid: f.snap_to_grid,
+            show_minimap: f.show_minimap,
             notes: f.notes,
             auto_connect_prevention: f.auto_connect_prevention,
             rules: RuleSet { groups, ..RuleSet::default() },
@@ -430,10 +489,112 @@ impl Canvas {
             sink_hide_mode: self.sink_hide_mode,
             link_style: self.link_style,
             show_external: self.show_external,
+            virtual_devices: self.virtual_devices.clone(),
+            snap_to_grid: self.snap_to_grid,
+            show_minimap: self.show_minimap,
             notes: self.notes.clone(),
             auto_connect_prevention: self.auto_connect_prevention,
             hide_all_sinks: self.sink_hide_mode == crate::storage::SinkHideMode::HideAll,
         }
+    }
+
+    /// Pan and zoom so all placed nodes and notes fit inside the current canvas viewport.
+    pub fn fit_to_view(&mut self) {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for (&id, &(x, y)) in &self.pos {
+            let (w, h) = self.node_sizes.get(&id).copied().unwrap_or((layout::NODE_W, 80.0));
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + w);
+            max_y = max_y.max(y + h);
+        }
+        for n in &self.notes {
+            min_x = min_x.min(n.pos.0);
+            min_y = min_y.min(n.pos.1);
+            max_x = max_x.max(n.pos.0 + n.size.0.max(80.0));
+            max_y = max_y.max(n.pos.1 + n.size.1.max(40.0));
+        }
+        if min_x.is_finite() && max_x.is_finite() {
+            let (pan, zoom) = layout::fit_to_view(
+                (min_x, min_y),
+                (max_x, max_y),
+                (self.last_rect_size.x, self.last_rect_size.y),
+                48.0,
+            );
+            self.pan = vec2(pan.0, pan.1);
+            self.zoom = zoom;
+            self.dirty = true;
+        }
+    }
+
+    /// Center the viewport on `node_id` and select it.
+    pub fn focus_node(&mut self, node_id: u32) {
+        if let Some(&(x, y)) = self.pos.get(&node_id) {
+            let (w, h) = self
+                .node_sizes
+                .get(&node_id)
+                .copied()
+                .unwrap_or((layout::NODE_W, 80.0));
+            let cx = x + w * 0.5;
+            let cy = y + h * 0.5;
+            self.pan = vec2(
+                self.last_rect_size.x * 0.5 - cx * self.zoom,
+                self.last_rect_size.y * 0.5 - cy * self.zoom,
+            );
+            self.sel_nodes.clear();
+            self.sel_notes.clear();
+            self.sel_nodes.insert(node_id);
+            self.dirty = true;
+        }
+    }
+
+    fn apply_node_alignment(&mut self, g: &Graph, op: impl FnOnce(&mut [(u32, layout::P, layout::P)])) {
+        let mut list: Vec<(u32, layout::P, layout::P)> = self
+            .sel_nodes
+            .iter()
+            .filter_map(|&id| {
+                let p = *self.pos.get(&id)?;
+                let sz = self.node_sizes.get(&id).copied().unwrap_or((layout::NODE_W, 80.0));
+                Some((id, p, sz))
+            })
+            .collect();
+        if list.len() < 2 {
+            return;
+        }
+        op(&mut list);
+        let snap = self.snap_to_grid;
+        for (id, mut p, _) in list {
+            if snap {
+                p = layout::snap_pos(p, layout::GRID_STEP * 0.5);
+            }
+            self.pos.insert(id, p);
+            if let Some(k) = g.nodes.get(&id).map(|n| n.key()) {
+                let alive = |nid| g.nodes.contains_key(&nid);
+                if layout::try_claim(&mut self.claimed, alive, &k, id) {
+                    self.saved.insert(k, p);
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub fn align_selected_left(&mut self, g: &Graph) {
+        self.apply_node_alignment(g, layout::align_left);
+    }
+
+    pub fn align_selected_top(&mut self, g: &Graph) {
+        self.apply_node_alignment(g, layout::align_top);
+    }
+
+    pub fn distribute_selected_vertical(&mut self, g: &Graph) {
+        self.apply_node_alignment(g, layout::distribute_vertical);
+    }
+
+    pub fn distribute_selected_horizontal(&mut self, g: &Graph) {
+        self.apply_node_alignment(g, layout::distribute_horizontal);
     }
 
     /// Move every selected node and text comment by `d` (world units), except `skip_node` / `skip_note`.
@@ -498,6 +659,14 @@ impl Canvas {
     pub fn show(&mut self, ui: &mut egui::Ui, g: &Graph) -> Option<Action> {
         let mut action = None;
         let (rect, bg) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        self.last_rect_size = rect.size();
+        if !ui.ctx().wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::Home))
+        {
+            self.fit_to_view();
+        }
+        let snap_active = self.snap_to_grid;
+        let grid_unit = layout::GRID_STEP * 0.5;
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::same(0), Color32::from_rgb(22, 23, 28));
         {
@@ -521,14 +690,23 @@ impl Canvas {
             }
         }
 
-        // Pan.
-        if bg.drag_started() && ui.input(|i| i.modifiers.shift) {
-            self.box_start = bg.interact_pointer_pos();
+        // Pan with middle mouse button only; left-drag on empty canvas starts a box
+        // (selection box, or Ctrl+drag zoom-to-fit box).
+        if bg.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = bg.interact_pointer_pos() {
+                let is_zoom = ui.input(|i| i.modifiers.ctrl);
+                self.box_start = Some((pos, is_zoom));
+            }
         }
-        if bg.dragged() && self.box_start.is_none() {
-            self.pan += bg.drag_delta();
+        if ui.rect_contains_pointer(rect)
+            && ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle))
+        {
+            let d = ui.input(|i| i.pointer.delta());
+            if d != Vec2::ZERO {
+                self.pan += d;
+            }
         }
-        if bg.drag_stopped() && self.box_start.is_none() {
+        if ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle)) {
             self.dirty = true;
         }
 
@@ -563,35 +741,6 @@ impl Canvas {
         let to_rect = |p: layout::P, h: f32, w: f32| {
             Rect::from_min_size(origin + vec2(p.0, p.1) * z, vec2(w, h) * z)
         };
-
-        // Right-click on empty canvas: add a comment or a block there.
-        if bg.secondary_clicked() {
-            self.ctx_pos = bg.interact_pointer_pos();
-        }
-        let mut new_note: Option<NoteKind> = None;
-        bg.context_menu(|ui| {
-            if ui.button("Add comment here").clicked() {
-                new_note = Some(NoteKind::Text);
-                ui.close_menu();
-            }
-            if ui.button("Add block here").clicked() {
-                new_note = Some(NoteKind::Block);
-                ui.close_menu();
-            }
-        });
-        if let (Some(kind), Some(p)) = (new_note, self.ctx_pos) {
-            let w = (p - origin) / z;
-            let id = self.notes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
-            let (size, text, color) = match kind {
-                NoteKind::Text => ((200.0, 0.0), String::new(), SWATCHES[7]),
-                NoteKind::Block => ((340.0, 220.0), "Group".to_string(), SWATCHES[6]),
-            };
-            self.note_buf = text.clone();
-            self.notes.push(Note { id, kind, pos: (w.x, w.y), size, text, color });
-            self.note_edit = Some(id);
-            self.note_edit_first = true;
-            self.dirty = true;
-        }
 
         // Blocks: translucent colored areas behind links and nodes. Only the
         // title bar is grabbed, so links and nodes over a block stay usable.
@@ -633,14 +782,17 @@ impl Canvas {
                 .interact(bar, ui.id().with(("note", n.id)), Sense::click_and_drag())
                 .on_hover_cursor(egui::CursorIcon::Grab)
                 .on_hover_text("Drag: move the block. Double-click: select the nodes and comments inside, then drag to move them too");
-            if resp.dragged() {
+            if resp.dragged_by(egui::PointerButton::Primary) {
                 let d = resp.drag_delta() / z;
                 self.notes[i].pos = (n.pos.0 + d.x, n.pos.1 + d.y);
                 if self.group_sel == Some(n.id) {
                     self.move_selected(g, d, None, None);
                 }
             }
-            if resp.drag_stopped() {
+            if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                if snap_active {
+                    self.notes[i].pos = layout::snap_pos(self.notes[i].pos, grid_unit);
+                }
                 self.dirty = true;
             }
             if resp.double_clicked() {
@@ -651,11 +803,11 @@ impl Canvas {
             let gresp = ui
                 .interact(grip, ui.id().with(("note_grip", n.id)), Sense::drag())
                 .on_hover_cursor(egui::CursorIcon::ResizeNwSe);
-            if gresp.dragged() {
+            if gresp.dragged_by(egui::PointerButton::Primary) {
                 let d = gresp.drag_delta() / z;
                 self.notes[i].size = ((n.size.0 + d.x).max(80.0), (n.size.1 + d.y).max(40.0));
             }
-            if gresp.drag_stopped() {
+            if gresp.drag_stopped_by(egui::PointerButton::Primary) {
                 self.dirty = true;
             }
             let gs = Stroke::new((1.5 * z).max(1.0), Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 200));
@@ -679,6 +831,7 @@ impl Canvas {
         };
 
         // Pass 1: place, interact (drag nodes, drag from ports), collect anchors.
+        self.node_sizes.clear();
         let mut items: Vec<Item> = Vec::new();
         let mut anchors: HashMap<u32, Pos2> = HashMap::new();
         let mut drag_started: Option<Pending> = None;
@@ -686,6 +839,8 @@ impl Canvas {
         let mut to_hide: Vec<String> = Vec::new();
         let mut color_set: Vec<(String, [u8; 3])> = Vec::new();
         let mut color_clear: Vec<String> = Vec::new();
+        let mut stereo_connect_req: Option<(u32, u32)> = None;
+        let mut align_op: Option<u8> = None;
         for node in g.nodes.values() {
             let key = (!node.name.is_empty()).then(|| node.key());
             if key.as_ref().is_some_and(|k| self.hidden.contains(k) || self.hidden.contains(&node.name)) {
@@ -759,6 +914,7 @@ impl Canvas {
                 all_rows.push(layout::VOL_ROW_H);
             }
             let (h, centers) = layout::node_rows(header_h, &all_rows);
+            self.node_sizes.insert(node.id, (w, h));
             let vol_y = has_vol.then(|| centers[row_h.len()]);
             let col = layout::column_for(&node.media_class);
             // Saved nodes are matched by key (or legacy name; ids change between sessions).
@@ -811,6 +967,44 @@ impl Canvas {
                                 ui.close_menu();
                             }
                         }
+                        if !outs.is_empty() {
+                            let targets: Vec<(u32, String)> = g
+                                .nodes
+                                .values()
+                                .filter(|o| o.id != node.id && !g.ports_of(o.id, Direction::In).is_empty())
+                                .map(|o| (o.id, o.label().to_string()))
+                                .collect();
+                            if !targets.is_empty() {
+                                ui.menu_button("Connect stereo to…", |ui| {
+                                    for (tid, tlabel) in &targets {
+                                        if ui.button(tlabel).clicked() {
+                                            stereo_connect_req = Some((node.id, *tid));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        if self.sel_nodes.len() >= 2 && self.sel_nodes.contains(&node.id) {
+                            ui.menu_button("Align / Distribute", |ui| {
+                                if ui.button("Align left").clicked() {
+                                    align_op = Some(1);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Align top").clicked() {
+                                    align_op = Some(2);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Distribute vertically").clicked() {
+                                    align_op = Some(3);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Distribute horizontally").clicked() {
+                                    align_op = Some(4);
+                                    ui.close_menu();
+                                }
+                            });
+                        }
                         ui.menu_button("Color", |ui| {
                             ui.horizontal(|ui| {
                                 for c in SWATCHES {
@@ -845,13 +1039,13 @@ impl Canvas {
                     if !add {
                         self.sel_nodes.clear();
                         self.sel_notes.clear();
+                        self.box_links.clear();
+                        self.selected = None;
                         self.group_sel = None;
                     }
                     self.sel_nodes.insert(node.id);
-                    self.box_links.clear();
-                    self.selected = None;
                 }
-                if resp.dragged() {
+                if resp.dragged_by(egui::PointerButton::Primary) {
                     let d = resp.drag_delta() / z;
                     p = (p.0 + d.x, p.1 + d.y);
                     self.pos.insert(node.id, p);
@@ -867,7 +1061,31 @@ impl Canvas {
                     }
                     r = to_rect(p, h, w);
                 }
-                if resp.drag_stopped() {
+                if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                    if snap_active {
+                        p = layout::snap_pos(p, grid_unit);
+                        self.pos.insert(node.id, p);
+                        if let Some(ref k) = key {
+                            let alive = |id| g.nodes.contains_key(&id);
+                            if layout::try_claim(&mut self.claimed, alive, k, node.id) {
+                                self.saved.insert(k.clone(), p);
+                            }
+                        }
+                        for &sid in &self.sel_nodes {
+                            if sid != node.id {
+                                if let Some(sp) = self.pos.get_mut(&sid) {
+                                    *sp = layout::snap_pos(*sp, grid_unit);
+                                    let snapped = *sp;
+                                    if let Some(sk) = g.nodes.get(&sid).map(|n| n.key()) {
+                                        let alive = |id| g.nodes.contains_key(&id);
+                                        if layout::try_claim(&mut self.claimed, alive, &sk, sid) {
+                                            self.saved.insert(sk, snapped);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.dirty = true;
                 }
             }
@@ -894,7 +1112,7 @@ impl Canvas {
                 let resp = ui
                     .interact(grip, ui.id().with(("grip", node.id)), Sense::click_and_drag())
                     .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-                if resp.dragged() {
+                if resp.dragged_by(egui::PointerButton::Primary) {
                     let nw = (w + resp.drag_delta().x / z)
                         .clamp(layout::MIN_RESIZE_W, layout::MAX_RESIZE_W);
                     self.width.insert(node.id, nw);
@@ -913,7 +1131,7 @@ impl Canvas {
                     }
                     self.dirty = true;
                 }
-                if resp.drag_stopped() {
+                if resp.drag_stopped_by(egui::PointerButton::Primary) {
                     self.dirty = true;
                 }
             }
@@ -922,6 +1140,17 @@ impl Canvas {
 
         for name in to_hide {
             self.hide(name);
+        }
+        if let Some((src_node, dst_node)) = stereo_connect_req {
+            let pairs = crate::links::stereo_node_pairs(g, src_node, dst_node);
+            self.extra_connects.extend(pairs);
+        }
+        match align_op {
+            Some(1) => self.align_selected_left(g),
+            Some(2) => self.align_selected_top(g),
+            Some(3) => self.distribute_selected_vertical(g),
+            Some(4) => self.distribute_selected_horizontal(g),
+            _ => {}
         }
         if !color_set.is_empty() || !color_clear.is_empty() {
             for (name, c) in color_set {
@@ -939,15 +1168,22 @@ impl Canvas {
         }
 
         // Finish a link drag: connect to the nearest compatible port, if any.
+        // Holding Shift also connects the matching stereo partner ports (e.g. FL + FR).
         if drag_stopped {
             if let Some(from) = self.pending.take() {
                 let pointer = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
                 if let Some(target) = pointer.and_then(|pos| self.target_at(pos, &anchors, g, from)) {
-                    action = Some(if from.from_out {
-                        Action::Connect { out_port: from.port, in_port: target }
+                    let (out_port, in_port) = if from.from_out {
+                        (from.port, target)
                     } else {
-                        Action::Connect { out_port: target, in_port: from.port }
-                    });
+                        (target, from.port)
+                    };
+                    action = Some(Action::Connect { out_port, in_port });
+                    if ui.input(|i| i.modifiers.shift) {
+                        if let Some(partner) = crate::links::stereo_partner_ports(g, out_port, in_port) {
+                            self.extra_connects.push(partner);
+                        }
+                    }
                 }
             }
         }
@@ -981,12 +1217,19 @@ impl Canvas {
         }
 
         // Pass 2: links (under the nodes). External ones only when revealed.
+        // Switch links remain drawn even when switched OFF (`enabled = false`).
         let mut shapes: Vec<((u32, u32), Vec<Pos2>)> = Vec::new();
+        let mut saved_of: HashMap<(u32, u32), usize> = HashMap::new();
+        for (i, l) in self.links.iter().enumerate() {
+            if let Some(p) = crate::links::resolve(g, l) {
+                saved_of.insert(p, i);
+            }
+        }
         let pairs: Vec<((u32, u32), bool)> = if self.virtual_mode {
             let mut v: Vec<((u32, u32), bool)> = self
                 .links
                 .iter()
-                .filter(|l| l.enabled)
+                .filter(|l| l.enabled || l.has_switch)
                 .filter_map(|l| crate::links::resolve(g, l))
                 .map(|p| (p, true))
                 .collect();
@@ -998,21 +1241,25 @@ impl Canvas {
             }
             v
         } else {
-            g.links.values().map(|l| ((l.out_port, l.in_port), g.is_owned(l))).collect()
-        };
-        let time = ui.input(|i| i.time) as f32;
-        // Saved links that have waypoints, by live port pair.
-        let mut wp_of: HashMap<(u32, u32), usize> = HashMap::new();
-        for (i, l) in self.links.iter().enumerate() {
-            if !l.waypoints.is_empty() {
+            let mut v: Vec<((u32, u32), bool)> = g
+                .links
+                .values()
+                .map(|l| ((l.out_port, l.in_port), g.is_owned(l)))
+                .collect();
+            for l in self.links.iter().filter(|l| l.has_switch) {
                 if let Some(p) = crate::links::resolve(g, l) {
-                    wp_of.insert(p, i);
+                    if !v.iter().any(|&(existing, _)| existing == p) {
+                        v.push((p, true));
+                    }
                 }
             }
-        }
+            v
+        };
+        let time = ui.input(|i| i.time) as f32;
         let to_screen = |w: (f32, f32)| origin + vec2(w.0, w.1) * z;
         let mut selectable: HashSet<(u32, u32)> = HashSet::new();
         let mut handles: Vec<(usize, usize, Pos2)> = Vec::new();
+        let mut switch_handles: Vec<(usize, (u32, u32), Pos2, bool, bool)> = Vec::new();
         if !pairs.is_empty() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         }
@@ -1023,53 +1270,123 @@ impl Canvas {
             let (Some(a), Some(b)) = (anchors.get(&pair.0), anchors.get(&pair.1)) else {
                 continue;
             };
-            let wps: Vec<Pos2> = wp_of
-                .get(&pair)
-                .map(|&i| self.links[i].waypoints.iter().map(|&w| to_screen(w)).collect())
+            let saved_idx = saved_of.get(&pair).copied();
+            let wps: Vec<Pos2> = saved_idx
+                .map(|i| self.links[i].waypoints.iter().map(|&w| to_screen(w)).collect())
                 .unwrap_or_default();
             if owned {
                 selectable.insert(pair);
             }
             let picked = self.selected == Some(pair) || self.box_links.contains(&pair);
             if picked {
-                if let Some(&i) = wp_of.get(&pair) {
+                if let Some(i) = saved_idx.filter(|&i| !self.links[i].waypoints.is_empty()) {
                     handles.extend(wps.iter().enumerate().map(|(k, p)| (i, k, *p)));
                 }
             }
-            let pts = link_path(self.link_style, *a, &wps, *b, z, pair.0);
-            let stroke = if picked {
-                Stroke::new((3.0 * z).clamp(2.0, 4.5), Color32::from_rgb(255, 206, 84))
-            } else if owned {
-                Stroke::new((2.2 * z).clamp(1.2, 3.2), Color32::from_rgb(92, 196, 230))
-            } else {
-                Stroke::new(
-                    (1.5 * z).clamp(1.0, 2.5),
-                    Color32::from_rgba_unmultiplied(150, 150, 165, 170),
-                )
-            };
-            {
-                // Soft glow under every link (grey for external ones).
-                let c = stroke.color;
-                let glow = Stroke::new(
-                    stroke.width * 3.2,
-                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 30),
+            let has_switch = owned && saved_idx.is_some_and(|i| self.links[i].has_switch);
+            let switch_on = saved_idx.map_or(true, |i| self.links[i].enabled);
+            if has_switch {
+                let sidx = saved_idx.unwrap();
+                let (pts_before, sw_mid, pts_after, pts_all) =
+                    if let Some(sp) = self.links[sidx].switch_pos {
+                        let mid = to_screen(sp);
+                        let k = waypoint_slot(self.link_style, *a, &wps, *b, mid, z, pair.0);
+                        let before = link_path(self.link_style, *a, &wps[..k], mid, z, pair.0);
+                        let after = link_path(self.link_style, mid, &wps[k..], *b, z, pair.0);
+                        let mut all = before.clone();
+                        if after.len() > 1 {
+                            all.extend_from_slice(&after[1..]);
+                        }
+                        (before, mid, after, all)
+                    } else {
+                        let all = link_path(self.link_style, *a, &wps, *b, z, pair.0);
+                        let (before, mid, after) = split_polyline_mid(&all);
+                        (before, mid, after, all)
+                    };
+                let w_stroke = if picked {
+                    (3.0 * z).clamp(2.0, 4.5)
+                } else {
+                    (2.3 * z).clamp(1.3, 3.3)
+                };
+                let active_col = if picked {
+                    Color32::from_rgb(255, 206, 84)
+                } else {
+                    Color32::from_rgb(186, 120, 255)
+                };
+                // First half (up to the switch): always colored and animated.
+                let stroke_before = Stroke::new(w_stroke, active_col);
+                let glow_before = Stroke::new(
+                    w_stroke * 3.2,
+                    Color32::from_rgba_unmultiplied(active_col.r(), active_col.g(), active_col.b(), 32),
                 );
-                painter.add(Shape::line(pts.clone(), glow));
+                painter.add(Shape::line(pts_before.clone(), glow_before));
+                painter.add(Shape::line(pts_before.clone(), stroke_before));
+                let dot_col = Color32::from_rgba_unmultiplied(
+                    active_col.r().saturating_add(65),
+                    active_col.g().saturating_add(65),
+                    active_col.b().saturating_add(65),
+                    235,
+                );
+                let r_dot = (w_stroke * 0.75).clamp(1.5, 3.0);
+                for p in dots_along(&pts_before, 26.0, time * 38.0) {
+                    painter.circle_filled(p, r_dot, dot_col);
+                }
+
+                // Second half (after the switch): colored + animated only when the switch is ON.
+                if switch_on {
+                    painter.add(Shape::line(pts_after.clone(), glow_before));
+                    painter.add(Shape::line(pts_after.clone(), stroke_before));
+                    for p in dots_along(&pts_after, 26.0, time * 38.0) {
+                        painter.circle_filled(p, r_dot, dot_col);
+                    }
+                } else {
+                    let off_col = if picked {
+                        Color32::from_rgba_unmultiplied(195, 160, 75, 130)
+                    } else {
+                        Color32::from_rgba_unmultiplied(110, 108, 128, 125)
+                    };
+                    let stroke_after = Stroke::new((1.6 * z).clamp(1.0, 2.5), off_col);
+                    painter.add(Shape::line(pts_after, stroke_after));
+                }
+
+                switch_handles.push((sidx, pair, sw_mid, switch_on, picked));
+                shapes.push((pair, pts_all));
+            } else {
+                let pts = link_path(self.link_style, *a, &wps, *b, z, pair.0);
+                let stroke = if picked {
+                    Stroke::new((3.0 * z).clamp(2.0, 4.5), Color32::from_rgb(255, 206, 84))
+                } else if owned {
+                    Stroke::new((2.2 * z).clamp(1.2, 3.2), Color32::from_rgb(92, 196, 230))
+                } else {
+                    Stroke::new(
+                        (1.5 * z).clamp(1.0, 2.5),
+                        Color32::from_rgba_unmultiplied(150, 150, 165, 170),
+                    )
+                };
+                {
+                    // Soft glow under every link (grey for external ones).
+                    let c = stroke.color;
+                    let glow = Stroke::new(
+                        stroke.width * 3.2,
+                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 30),
+                    );
+                    painter.add(Shape::line(pts.clone(), glow));
+                }
+                painter.add(Shape::line(pts.clone(), stroke));
+                // Dots flowing from the output port to the input port.
+                let c = stroke.color;
+                let dot = Color32::from_rgba_unmultiplied(
+                    c.r().saturating_add(70),
+                    c.g().saturating_add(70),
+                    c.b().saturating_add(70),
+                    230,
+                );
+                let r_dot = (stroke.width * 0.75).clamp(1.5, 3.0);
+                for p in dots_along(&pts, 26.0, time * 38.0) {
+                    painter.circle_filled(p, r_dot, dot);
+                }
+                shapes.push((pair, pts));
             }
-            painter.add(Shape::line(pts.clone(), stroke));
-            // Dots flowing from the output port to the input port.
-            let c = stroke.color;
-            let dot = Color32::from_rgba_unmultiplied(
-                c.r().saturating_add(70),
-                c.g().saturating_add(70),
-                c.b().saturating_add(70),
-                230,
-            );
-            let r_dot = (stroke.width * 0.75).clamp(1.5, 3.0);
-            for p in dots_along(&pts, 26.0, time * 38.0) {
-                painter.circle_filled(p, r_dot, dot);
-            }
-            shapes.push((pair, pts));
         }
 
         // Waypoint handles of picked links: drag to move, double-click to remove.
@@ -1083,10 +1400,16 @@ impl Canvas {
                 Sense::click_and_drag(),
             );
             handle_hit |= resp.hovered() || resp.dragged();
-            if resp.dragged() {
+            if resp.dragged_by(egui::PointerButton::Primary) {
                 let d = resp.drag_delta() / z;
                 if let Some(w) = self.links.get_mut(i).and_then(|l| l.waypoints.get_mut(k)) {
                     *w = (w.0 + d.x, w.1 + d.y);
+                    self.dirty = true;
+                }
+            }
+            if resp.drag_stopped_by(egui::PointerButton::Primary) && snap_active {
+                if let Some(w) = self.links.get_mut(i).and_then(|l| l.waypoints.get_mut(k)) {
+                    *w = layout::snap_pos(*w, grid_unit);
                     self.dirty = true;
                 }
             }
@@ -1109,6 +1432,158 @@ impl Canvas {
                 }
             }
         }
+
+        // Inline switch boxes on switch cables: click to toggle ON/OFF, drag to reposition.
+        for (sidx, pair, sw_pos, sw_on, picked) in switch_handles {
+            let zz = z.clamp(0.75, 1.3);
+            let sw_size = vec2(32.0, 16.0) * zz;
+            let sw_rect = Rect::from_center_size(sw_pos, sw_size);
+            let resp = ui
+                .interact(
+                    sw_rect.expand(2.0),
+                    ui.id().with(("sw_box", sidx)),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if sw_on {
+                    "Switch is ON: click to turn off, drag to move"
+                } else {
+                    "Switch is OFF: click to turn on, drag to move"
+                });
+            handle_hit |= resp.hovered() || resp.dragged();
+            if resp.clicked() {
+                let new_on = !sw_on;
+                if let Some(l) = self.links.get_mut(sidx) {
+                    l.enabled = new_on;
+                    self.dirty = true;
+                }
+                action = Some(Action::SetLinkEnabled {
+                    out_port: pair.0,
+                    in_port: pair.1,
+                    enabled: new_on,
+                });
+            }
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                let d = resp.drag_delta() / z;
+                let cur = self
+                    .links
+                    .get(sidx)
+                    .and_then(|l| l.switch_pos)
+                    .unwrap_or_else(|| {
+                        let w = (sw_pos - origin) / z;
+                        (w.x, w.y)
+                    });
+                if let Some(l) = self.links.get_mut(sidx) {
+                    l.switch_pos = Some((cur.0 + d.x, cur.1 + d.y));
+                    self.dirty = true;
+                }
+            }
+            if resp.drag_stopped_by(egui::PointerButton::Primary) && snap_active {
+                if let Some(l) = self.links.get_mut(sidx) {
+                    if let Some(sp) = l.switch_pos {
+                        l.switch_pos = Some(layout::snap_pos(sp, grid_unit));
+                        self.dirty = true;
+                    }
+                }
+            }
+            resp.context_menu(|ui| {
+                if ui
+                    .button(if sw_on { "Turn switch off" } else { "Turn switch on" })
+                    .clicked()
+                {
+                    let new_on = !sw_on;
+                    if let Some(l) = self.links.get_mut(sidx) {
+                        l.enabled = new_on;
+                        self.dirty = true;
+                    }
+                    action = Some(Action::SetLinkEnabled {
+                        out_port: pair.0,
+                        in_port: pair.1,
+                        enabled: new_on,
+                    });
+                    ui.close_menu();
+                }
+                let has_custom_pos = self.links.get(sidx).is_some_and(|l| l.switch_pos.is_some());
+                if ui
+                    .add_enabled(has_custom_pos, egui::Button::new("Reset switch position"))
+                    .clicked()
+                {
+                    if let Some(l) = self.links.get_mut(sidx) {
+                        l.switch_pos = None;
+                        self.dirty = true;
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Remove switch").clicked() {
+                    if let Some(l) = self.links.get_mut(sidx) {
+                        let was_off = !l.enabled;
+                        l.has_switch = false;
+                        l.switch_pos = None;
+                        l.enabled = true;
+                        self.dirty = true;
+                        if was_off {
+                            action = Some(Action::SetLinkEnabled {
+                                out_port: pair.0,
+                                in_port: pair.1,
+                                enabled: true,
+                            });
+                        }
+                    }
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Delete link").clicked() {
+                    action = Some(Action::Disconnect {
+                        out_port: pair.0,
+                        in_port: pair.1,
+                    });
+                    self.selected = None;
+                    ui.close_menu();
+                }
+            });
+
+            let rad = (sw_size.y * 0.5).round() as u8;
+            painter.rect_filled(
+                sw_rect.translate(vec2(0.0, 2.0 * zz)).expand(1.5 * zz),
+                CornerRadius::same(rad),
+                Color32::from_black_alpha(90),
+            );
+            let bg_fill = if sw_on {
+                Color32::from_rgb(56, 38, 82)
+            } else {
+                Color32::from_rgb(30, 31, 38)
+            };
+            painter.rect_filled(sw_rect, CornerRadius::same(rad), bg_fill);
+            let border_col = if picked || resp.hovered() {
+                Color32::from_rgb(255, 206, 84)
+            } else if sw_on {
+                Color32::from_rgb(186, 120, 255)
+            } else {
+                Color32::from_rgb(105, 100, 125)
+            };
+            painter.rect_stroke(
+                sw_rect,
+                CornerRadius::same(rad),
+                Stroke::new((1.6 * zz).max(1.0), border_col),
+                egui::StrokeKind::Inside,
+            );
+            let knob_x = if sw_on {
+                sw_rect.max.x - sw_size.y * 0.5
+            } else {
+                sw_rect.min.x + sw_size.y * 0.5
+            };
+            let knob_col = if sw_on {
+                Color32::from_rgb(225, 185, 255)
+            } else {
+                Color32::from_gray(135)
+            };
+            painter.circle_filled(
+                pos2(knob_x, sw_rect.center().y),
+                sw_size.y * 0.34,
+                knob_col,
+            );
+        }
+
         // Double-click on one of our links adds a waypoint there.
         if bg.double_clicked() && !handle_hit {
             if let Some(pos) = bg.interact_pointer_pos() {
@@ -1140,38 +1615,231 @@ impl Canvas {
             }
         }
 
-        // Shift+drag box: pick nodes and/or our own links inside it.
-        if let (Some(start), true) = (self.box_start, bg.drag_stopped()) {
+        // Right-click on a link or on empty canvas.
+        if bg.secondary_clicked() {
+            if let Some(pos) = bg.interact_pointer_pos() {
+                let hit = shapes
+                    .iter()
+                    .map(|(pair, pts)| {
+                        let line: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
+                        (*pair, layout::dist_to_polyline((pos.x, pos.y), &line))
+                    })
+                    .filter(|(_, d)| *d <= 8.0)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(pair, _)| pair);
+                if let Some(pair) = hit {
+                    let owned = selectable.contains(&pair);
+                    self.ctx_link = Some((pair, pos, owned));
+                    self.selected = Some(pair);
+                } else {
+                    self.ctx_link = None;
+                    self.ctx_pos = Some(pos);
+                }
+            }
+        }
+        let mut new_note: Option<NoteKind> = None;
+        bg.context_menu(|ui| {
+            if let Some((pair, click_pos, owned)) = self.ctx_link {
+                if owned {
+                    let saved_idx = crate::links::from_ports(g, pair.0, pair.1)
+                        .and_then(|s| crate::links::find(&self.links, &s));
+                    if let Some(i) = saved_idx {
+                        if !self.links[i].has_switch {
+                            if ui
+                                .button("Make switch")
+                                .on_hover_text("Add an inline on/off switch box on this connection")
+                                .clicked()
+                            {
+                                self.links[i].has_switch = true;
+                                self.links[i].switch_pos = None;
+                                self.dirty = true;
+                                ui.close_menu();
+                            }
+                        } else {
+                            let on = self.links[i].enabled;
+                            if ui
+                                .button(if on { "Turn switch off" } else { "Turn switch on" })
+                                .clicked()
+                            {
+                                self.links[i].enabled = !on;
+                                self.dirty = true;
+                                action = Some(Action::SetLinkEnabled {
+                                    out_port: pair.0,
+                                    in_port: pair.1,
+                                    enabled: !on,
+                                });
+                                ui.close_menu();
+                            }
+                            if self.links[i].switch_pos.is_some()
+                                && ui.button("Reset switch position").clicked()
+                            {
+                                self.links[i].switch_pos = None;
+                                self.dirty = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("Remove switch").clicked() {
+                                let was_off = !self.links[i].enabled;
+                                self.links[i].has_switch = false;
+                                self.links[i].switch_pos = None;
+                                self.links[i].enabled = true;
+                                self.dirty = true;
+                                if was_off {
+                                    action = Some(Action::SetLinkEnabled {
+                                        out_port: pair.0,
+                                        in_port: pair.1,
+                                        enabled: true,
+                                    });
+                                }
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                    }
+                    if ui.button("Add waypoint here").clicked() {
+                        if let (Some(i), Some(&a), Some(&b)) =
+                            (saved_idx, anchors.get(&pair.0), anchors.get(&pair.1))
+                        {
+                            let existing: Vec<Pos2> =
+                                self.links[i].waypoints.iter().map(|&w| to_screen(w)).collect();
+                            let k = waypoint_slot(self.link_style, a, &existing, b, click_pos, z, pair.0);
+                            let world = (click_pos - origin) / z;
+                            self.links[i].waypoints.insert(k, (world.x, world.y));
+                            self.dirty = true;
+                        }
+                        ui.close_menu();
+                    }
+                    let has_wps = saved_idx.is_some_and(|i| !self.links[i].waypoints.is_empty());
+                    if ui.add_enabled(has_wps, egui::Button::new("Clear waypoints")).clicked() {
+                        if let Some(i) = saved_idx {
+                            self.links[i].waypoints.clear();
+                            self.dirty = true;
+                        }
+                        ui.close_menu();
+                    }
+                    if let Some(i) = saved_idx {
+                        let mut linger = self.links[i].lingering;
+                        if ui
+                            .checkbox(&mut linger, "Keep after quit")
+                            .on_hover_text("Set object.linger = true so PipeWire keeps this link alive after RedoxRouter closes")
+                            .changed()
+                        {
+                            self.links[i].lingering = linger;
+                            self.dirty = true;
+                            action = Some(Action::SetLinkLinger {
+                                out_port: pair.0,
+                                in_port: pair.1,
+                                lingering: linger,
+                            });
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Delete link").clicked() {
+                        action = Some(Action::Disconnect {
+                            out_port: pair.0,
+                            in_port: pair.1,
+                        });
+                        self.selected = None;
+                        ui.close_menu();
+                    }
+                } else {
+                    if ui.button("Make Redox connection").clicked() {
+                        action = Some(Action::TakeOver {
+                            out_port: pair.0,
+                            in_port: pair.1,
+                        });
+                        ui.close_menu();
+                    }
+                    if self.revealed.contains(&pair) {
+                        if ui.button("Hide external link").clicked() {
+                            self.revealed.remove(&pair);
+                            self.selected = None;
+                            ui.close_menu();
+                        }
+                    }
+                }
+            } else {
+                if ui.button("Add comment here").clicked() {
+                    new_note = Some(NoteKind::Text);
+                    ui.close_menu();
+                }
+                if ui.button("Add block here").clicked() {
+                    new_note = Some(NoteKind::Block);
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Fit to view (F)").clicked() {
+                    self.fit_to_view();
+                    ui.close_menu();
+                }
+            }
+        });
+        if let (Some(kind), Some(p)) = (new_note, self.ctx_pos) {
+            let w = (p - origin) / z;
+            let id = self.notes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+            let (size, text, color) = match kind {
+                NoteKind::Text => ((200.0, 0.0), String::new(), SWATCHES[7]),
+                NoteKind::Block => ((340.0, 220.0), "Group".to_string(), SWATCHES[6]),
+            };
+            self.note_buf = text.clone();
+            self.notes.push(Note { id, kind, pos: (w.x, w.y), size, text, color });
+            self.note_edit = Some(id);
+            self.note_edit_first = true;
+            self.dirty = true;
+        }
+
+        // Left-drag box: either Ctrl+drag to fit the drawn box to screen,
+        // or normal/Shift+drag to select (Shift adds to selection).
+        if let (Some((start, start_ctrl)), true) =
+            (self.box_start, bg.drag_stopped_by(egui::PointerButton::Primary))
+        {
             let end = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
             if let Some(end) = end {
                 let bx = Rect::from_two_pos(start, end);
-                let add = ui.input(|i| i.modifiers.ctrl);
-                if !add {
-                    self.sel_nodes.clear();
-                    self.sel_notes.clear();
-                    self.box_links.clear();
-                    self.selected = None;
-                    self.group_sel = None;
-                }
-                if self.select_mode != SelectMode::Links {
-                    for it in &items {
-                        if it.rect.intersects(bx) {
-                            self.sel_nodes.insert(it.node.id);
-                        }
+                let is_zoom = start_ctrl || ui.input(|i| i.modifiers.ctrl);
+                if is_zoom {
+                    if bx.width() > 8.0 && bx.height() > 8.0 {
+                        let w_min = (bx.min - origin) / z;
+                        let w_max = (bx.max - origin) / z;
+                        let (pan, zoom) = layout::fit_to_view(
+                            (w_min.x, w_min.y),
+                            (w_max.x, w_max.y),
+                            (rect.width(), rect.height()),
+                            16.0,
+                        );
+                        self.pan = vec2(pan.0, pan.1);
+                        self.zoom = zoom;
+                        self.dirty = true;
                     }
-                    for note in &self.notes {
-                        if note.kind == NoteKind::Text {
-                            let (cr, _) = comment_rect_and_galley(&painter, origin, z, note);
-                            if cr.intersects(bx) {
-                                self.sel_notes.insert(note.id);
+                } else {
+                    let add = ui.input(|i| i.modifiers.shift);
+                    if !add {
+                        self.sel_nodes.clear();
+                        self.sel_notes.clear();
+                        self.box_links.clear();
+                        self.selected = None;
+                        self.group_sel = None;
+                    }
+                    if self.select_mode != SelectMode::Links {
+                        for it in &items {
+                            if it.rect.intersects(bx) {
+                                self.sel_nodes.insert(it.node.id);
+                            }
+                        }
+                        for note in &self.notes {
+                            if note.kind == NoteKind::Text {
+                                let (cr, _) = comment_rect_and_galley(&painter, origin, z, note);
+                                if cr.intersects(bx) {
+                                    self.sel_notes.insert(note.id);
+                                }
                             }
                         }
                     }
-                }
-                if self.select_mode != SelectMode::Nodes {
-                    for (pair, pts) in &shapes {
-                        if selectable.contains(pair) && pts.iter().any(|p| bx.contains(*p)) {
-                            self.box_links.insert(*pair);
+                    if self.select_mode != SelectMode::Nodes {
+                        for (pair, pts) in &shapes {
+                            if selectable.contains(pair) && pts.iter().any(|p| bx.contains(*p)) {
+                                self.box_links.insert(*pair);
+                            }
                         }
                     }
                 }
@@ -1186,40 +1854,61 @@ impl Canvas {
             self.extra_disconnects.extend(self.box_links.drain());
         }
 
-        // Click selects the nearest link; click on empty space clears.
-        if bg.clicked() {
-            self.sel_nodes.clear();
-            self.sel_notes.clear();
-            self.box_links.clear();
-            self.group_sel = None;
-        }
-        if bg.clicked() && self.select_mode == SelectMode::Nodes {
-            self.selected = None;
-        } else if bg.clicked() {
-            self.selected = bg.interact_pointer_pos().and_then(|pos| {
-                shapes
-                    .iter()
-                    .map(|(pair, pts)| {
-                        let d = layout::dist_to_polyline(
-                            (pos.x, pos.y),
-                            &pts.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
-                        );
-                        (*pair, d)
-                    })
-                    .filter(|(_, d)| *d <= 7.0)
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(pair, _)| pair)
-            });
+        // Left-click selects the nearest link (Shift+click adds); click on empty space clears.
+        if bg.clicked() && !handle_hit {
+            let add = ui.input(|i| i.modifiers.shift);
+            if !add {
+                self.sel_nodes.clear();
+                self.sel_notes.clear();
+                self.box_links.clear();
+                self.group_sel = None;
+            }
+            let hit_link = if self.select_mode == SelectMode::Nodes {
+                None
+            } else {
+                bg.interact_pointer_pos().and_then(|pos| {
+                    shapes
+                        .iter()
+                        .map(|(pair, pts)| {
+                            let d = layout::dist_to_polyline(
+                                (pos.x, pos.y),
+                                &pts.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
+                            );
+                            (*pair, d)
+                        })
+                        .filter(|(_, d)| *d <= 7.0)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(pair, _)| pair)
+                })
+            };
+            if add {
+                if let Some(pair) = hit_link {
+                    if let Some(prev) = self.selected {
+                        if selectable.contains(&prev) {
+                            self.box_links.insert(prev);
+                        }
+                    }
+                    if selectable.contains(&pair) {
+                        self.box_links.insert(pair);
+                    }
+                    self.selected = Some(pair);
+                }
+            } else {
+                self.selected = hit_link;
+            }
         }
         // Delete removes the selected link, but only if we own it.
         if let Some(pair) = self.selected {
             // Forget the selection if the link is gone or no longer drawn
             // (e.g. one of its nodes was hidden).
-            let gone = !self.virtual_mode && g.find_link(pair.0, pair.1).is_none();
+            let gone = !self.virtual_mode
+                && g.find_link(pair.0, pair.1).is_none()
+                && !selectable.contains(&pair);
             if gone || !shapes.iter().any(|(p, _)| *p == pair) {
                 self.selected = None;
             } else if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
                 let owned = self.virtual_mode
+                    || selectable.contains(&pair)
                     || g.find_link(pair.0, pair.1).is_some_and(|l| g.is_owned(l));
                 if owned {
                     action = Some(Action::Disconnect { out_port: pair.0, in_port: pair.1 });
@@ -1373,7 +2062,7 @@ impl Canvas {
                     resp.clone().on_hover_text("Device volume: change it in your system volume control");
                 }
                 let mut new_s = None;
-                if can_edit && (resp.dragged() || resp.clicked()) {
+                if can_edit && (resp.dragged_by(egui::PointerButton::Primary) || resp.clicked()) {
                     if let Some(p) = resp.interact_pointer_pos() {
                         let t = ((p.x - track.min.x) / track.width()).clamp(0.0, 1.0);
                         new_s = Some(t * volume::SLIDER_MAX);
@@ -1480,20 +2169,23 @@ impl Canvas {
                 if !add {
                     self.sel_nodes.clear();
                     self.sel_notes.clear();
+                    self.box_links.clear();
+                    self.selected = None;
                     self.group_sel = None;
                 }
                 self.sel_notes.insert(n.id);
-                self.box_links.clear();
-                self.selected = None;
             }
-            if resp.dragged() {
+            if resp.dragged_by(egui::PointerButton::Primary) {
                 let d = resp.drag_delta() / z;
                 self.notes[i].pos = (n.pos.0 + d.x, n.pos.1 + d.y);
                 if self.sel_notes.contains(&n.id) {
                     self.move_selected(g, d, None, Some(n.id));
                 }
             }
-            if resp.drag_stopped() {
+            if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                if snap_active {
+                    self.notes[i].pos = layout::snap_pos(self.notes[i].pos, grid_unit);
+                }
                 self.dirty = true;
             }
             if resp.double_clicked() {
@@ -1505,11 +2197,11 @@ impl Canvas {
             let gresp = ui
                 .interact(grip, ui.id().with(("note_grip", n.id)), Sense::drag())
                 .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-            if gresp.dragged() {
+            if gresp.dragged_by(egui::PointerButton::Primary) {
                 let d = gresp.drag_delta().x / z;
                 self.notes[i].size.0 = (n.size.0 + d).max(80.0);
             }
-            if gresp.drag_stopped() {
+            if gresp.drag_stopped_by(egui::PointerButton::Primary) {
                 self.dirty = true;
             }
         }
@@ -1536,16 +2228,71 @@ impl Canvas {
             }
         }
 
-        // Pass 4: the link currently being dragged.
+        // Pass 4: the link currently being dragged, plus a growing/fading ping circle
+        // when close enough to a compatible port to connect on release.
         if let Some(from) = self.pending {
             let pointer = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
             if let (Some(&a), Some(m)) = (anchors.get(&from.port), pointer) {
+                let target_port = self.target_at(m, &anchors, g, from);
                 let (s, e) = if from.from_out { (a, m) } else { (m, a) };
                 let pts = link_path(self.link_style, s, &[], e, z, 0);
                 painter.add(Shape::line(
                     pts,
                     Stroke::new((2.4 * z).clamp(1.2, 3.4), Color32::from_rgb(255, 206, 84)),
                 ));
+                if let Some(tid) = target_port {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                    let port_col = if from.from_out {
+                        Color32::from_rgb(240, 170, 90) // target is an input port
+                    } else {
+                        Color32::from_rgb(110, 210, 140) // target is an output port
+                    };
+                    let mut ping_ports = vec![tid];
+                    if ui.input(|i| i.modifiers.shift) {
+                        let (out_p, in_p) = if from.from_out {
+                            (from.port, tid)
+                        } else {
+                            (tid, from.port)
+                        };
+                        if let Some((out2, in2)) = crate::links::stereo_partner_ports(g, out_p, in_p) {
+                            ping_ports.push(if from.from_out { in2 } else { out2 });
+                        }
+                    }
+                    for pid in ping_ports {
+                        if let Some(&t_anchor) = anchors.get(&pid) {
+                            for offset in [0.0_f32, 0.5_f32] {
+                                let t = (time * 1.6 + offset).fract();
+                                let ease = 1.0 - (1.0 - t) * (1.0 - t);
+                                let radius = (4.5 + 16.0 * ease) * z.max(0.75);
+                                let alpha = ((1.0 - t).powi(2) * 235.0) as u8;
+                                let ring_col = Color32::from_rgba_unmultiplied(
+                                    port_col.r(),
+                                    port_col.g(),
+                                    port_col.b(),
+                                    alpha,
+                                );
+                                let fill_col = Color32::from_rgba_unmultiplied(
+                                    port_col.r(),
+                                    port_col.g(),
+                                    port_col.b(),
+                                    alpha / 5,
+                                );
+                                painter.circle_filled(t_anchor, radius, fill_col);
+                                painter.circle_stroke(
+                                    t_anchor,
+                                    radius,
+                                    Stroke::new((2.2 * (1.0 - 0.5 * t) * z).max(1.0), ring_col),
+                                );
+                            }
+                            painter.circle(
+                                t_anchor,
+                                5.6 * z,
+                                port_col,
+                                Stroke::new(1.8 * z, Color32::WHITE),
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1596,26 +2343,180 @@ impl Canvas {
             }
         }
 
-        // Box being dragged.
-        if let Some(start) = self.box_start {
+        // Box being dragged (selection box, or Ctrl+drag zoom-to-screen box).
+        if let Some((start, start_ctrl)) = self.box_start {
             if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
                 let bx = Rect::from_two_pos(start, cur);
-                painter.rect_filled(bx, CornerRadius::same(2), Color32::from_rgba_unmultiplied(92, 196, 230, 30));
-                painter.rect_stroke(
-                    bx,
-                    CornerRadius::same(2),
-                    Stroke::new(1.0_f32, Color32::from_rgb(92, 196, 230)),
-                    egui::StrokeKind::Inside,
-                );
+                let is_zoom = start_ctrl || ui.input(|i| i.modifiers.ctrl);
+                if is_zoom {
+                    painter.rect_filled(
+                        bx,
+                        CornerRadius::same(3),
+                        Color32::from_rgba_unmultiplied(255, 206, 84, 28),
+                    );
+                    painter.rect_stroke(
+                        bx,
+                        CornerRadius::same(3),
+                        Stroke::new(1.5_f32, Color32::from_rgb(255, 206, 84)),
+                        egui::StrokeKind::Inside,
+                    );
+                    if bx.width() > 60.0 && bx.height() > 24.0 {
+                        painter.text(
+                            bx.min + vec2(6.0, 4.0),
+                            egui::Align2::LEFT_TOP,
+                            "Fit box to screen",
+                            FontId::proportional(11.0),
+                            Color32::from_rgb(255, 206, 84),
+                        );
+                    }
+                } else {
+                    painter.rect_filled(
+                        bx,
+                        CornerRadius::same(2),
+                        Color32::from_rgba_unmultiplied(92, 196, 230, 30),
+                    );
+                    painter.rect_stroke(
+                        bx,
+                        CornerRadius::same(2),
+                        Stroke::new(1.0_f32, Color32::from_rgb(92, 196, 230)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
         }
 
-        // Bottom-right: what box select / clicks may pick.
+        // Bottom-left: interactive Minimap.
+        if self.show_minimap && (!items.is_empty() || !self.notes.is_empty()) {
+            let map_size = vec2(170.0, 110.0);
+            let map_rect = Rect::from_min_size(
+                pos2(rect.min.x + 12.0, rect.max.y - map_size.y - 12.0),
+                map_size,
+            );
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for it in &items {
+                if let Some(&(x, y)) = self.pos.get(&it.node.id) {
+                    let (w, h) = self.node_sizes.get(&it.node.id).copied().unwrap_or((it.w, 60.0));
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x + w);
+                    max_y = max_y.max(y + h);
+                }
+            }
+            for n in &self.notes {
+                min_x = min_x.min(n.pos.0);
+                min_y = min_y.min(n.pos.1);
+                max_x = max_x.max(n.pos.0 + n.size.0.max(80.0));
+                max_y = max_y.max(n.pos.1 + n.size.1.max(40.0));
+            }
+            // Include current camera viewport in world bounds so the camera box stays visible.
+            let cam_min = (-self.pan.x / z, -self.pan.y / z);
+            let cam_max = (
+                (rect.width() - self.pan.x) / z,
+                (rect.height() - self.pan.y) / z,
+            );
+            min_x = min_x.min(cam_min.0) - 40.0;
+            min_y = min_y.min(cam_min.1) - 40.0;
+            max_x = max_x.max(cam_max.0) + 40.0;
+            max_y = max_y.max(cam_max.1) + 40.0;
+
+            let world_w = (max_x - min_x).max(1.0);
+            let world_h = (max_y - min_y).max(1.0);
+            let inner = map_rect.shrink(6.0);
+            let scale = (inner.width() / world_w).min(inner.height() / world_h);
+            let map_origin = inner.center() - vec2(world_w * scale * 0.5, world_h * scale * 0.5);
+            let to_map = |wx: f32, wy: f32| {
+                map_origin + vec2((wx - min_x) * scale, (wy - min_y) * scale)
+            };
+
+            painter.rect_filled(
+                map_rect,
+                CornerRadius::same(8),
+                Color32::from_rgba_unmultiplied(24, 26, 32, 220),
+            );
+            painter.rect_stroke(
+                map_rect,
+                CornerRadius::same(8),
+                Stroke::new(1.0_f32, Color32::from_gray(64)),
+                egui::StrokeKind::Inside,
+            );
+
+            let mp = painter.with_clip_rect(inner);
+            for n in &self.notes {
+                if n.kind == NoteKind::Block {
+                    let a = to_map(n.pos.0, n.pos.1);
+                    let b = to_map(n.pos.0 + n.size.0, n.pos.1 + n.size.1);
+                    let c = n.color;
+                    mp.rect_filled(
+                        Rect::from_min_max(a, b),
+                        CornerRadius::same(2),
+                        Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 50),
+                    );
+                }
+            }
+            for it in &items {
+                if let Some(&(x, y)) = self.pos.get(&it.node.id) {
+                    let (w, h) = self.node_sizes.get(&it.node.id).copied().unwrap_or((it.w, 60.0));
+                    let a = to_map(x, y);
+                    let b = to_map(x + w, y + h);
+                    let col = if self.sel_nodes.contains(&it.node.id) {
+                        Color32::from_rgb(92, 196, 230)
+                    } else {
+                        it.color.unwrap_or(Color32::from_gray(130))
+                    };
+                    mp.rect_filled(Rect::from_min_max(a, b), CornerRadius::same(2), col);
+                }
+            }
+            let vp_rect = Rect::from_min_max(
+                to_map(cam_min.0, cam_min.1),
+                to_map(cam_max.0, cam_max.1),
+            );
+            mp.rect_stroke(
+                vp_rect,
+                CornerRadius::same(2),
+                Stroke::new(1.2_f32, Color32::from_rgb(92, 196, 230)),
+                egui::StrokeKind::Inside,
+            );
+
+            let mresp = ui
+                .interact(map_rect, ui.id().with("minimap"), Sense::click_and_drag())
+                .on_hover_text("Minimap: click or drag to pan");
+            if mresp.clicked() || mresp.dragged_by(egui::PointerButton::Primary) {
+                if let Some(p) = mresp.interact_pointer_pos() {
+                    let wx = min_x + (p.x - map_origin.x) / scale;
+                    let wy = min_y + (p.y - map_origin.y) / scale;
+                    self.pan = vec2(rect.width() * 0.5 - wx * z, rect.height() * 0.5 - wy * z);
+                    self.dirty = true;
+                }
+            }
+        }
+
+        // Bottom-right: what box select / clicks may pick, plus Align/Distribute when 2+ nodes are selected.
+        let mut bottom_align_op: Option<u8> = None;
         egui::Area::new(egui::Id::new("select_mode"))
             .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-12.0, -12.0))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    if self.sel_nodes.len() >= 2 {
+                        ui.horizontal(|ui| {
+                            ui.weak(format!("{} nodes:", self.sel_nodes.len()));
+                            if ui.small_button("Align L").on_hover_text("Align selected nodes to left edge").clicked() {
+                                bottom_align_op = Some(1);
+                            }
+                            if ui.small_button("Align T").on_hover_text("Align selected nodes to top edge").clicked() {
+                                bottom_align_op = Some(2);
+                            }
+                            if ui.small_button("Dist V").on_hover_text("Distribute selected nodes vertically").clicked() {
+                                bottom_align_op = Some(3);
+                            }
+                            if ui.small_button("Dist H").on_hover_text("Distribute selected nodes horizontally").clicked() {
+                                bottom_align_op = Some(4);
+                            }
+                        });
+                    }
                     ui.horizontal(|ui| {
                         ui.weak("Select");
                         for (m, label) in [
@@ -1626,9 +2527,16 @@ impl Canvas {
                             ui.selectable_value(&mut self.select_mode, m, label);
                         }
                     });
-                    ui.small("Shift+drag = box, Ctrl adds");
+                    ui.small("Left-drag = select • Shift = add • Ctrl+drag = zoom box • Middle-drag = pan");
                 });
             });
+        match bottom_align_op {
+            Some(1) => self.align_selected_left(g),
+            Some(2) => self.align_selected_top(g),
+            Some(3) => self.distribute_selected_vertical(g),
+            Some(4) => self.distribute_selected_horizontal(g),
+            _ => {}
+        }
         match self.select_mode {
             SelectMode::Nodes => {
                 self.box_links.clear();
@@ -1706,5 +2614,22 @@ impl Canvas {
             .filter(|(_, d)| *d <= reach)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_polyline_at_midpoint() {
+        let pts = vec![pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 20.0)];
+        let (before, mid, after) = split_polyline_mid(&pts);
+        // Total length is 10 + 20 = 30, so midpoint is at distance 15 -> (10.0, 5.0).
+        assert!((mid.x - 10.0).abs() < 1e-4 && (mid.y - 5.0).abs() < 1e-4);
+        assert_eq!(before.first().copied(), Some(pos2(0.0, 0.0)));
+        assert_eq!(before.last().copied(), Some(mid));
+        assert_eq!(after.first().copied(), Some(mid));
+        assert_eq!(after.last().copied(), Some(pos2(10.0, 20.0)));
     }
 }

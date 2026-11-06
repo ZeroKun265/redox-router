@@ -20,6 +20,15 @@ pub struct SavedLink {
     /// Points (world coordinates) the cable is routed through.
     #[serde(default)]
     pub waypoints: Vec<(f32, f32)>,
+    /// Keep this PipeWire link alive even after RedoxRouter quits (`object.linger = true`).
+    #[serde(default)]
+    pub lingering: bool,
+    /// Render an inline on/off switch box on this cable so it can be toggled without forgetting it.
+    #[serde(default)]
+    pub has_switch: bool,
+    /// Optional world position `(x, y)` of the switch box; when `None`, sits at the cable midpoint.
+    #[serde(default)]
+    pub switch_pos: Option<(f32, f32)>,
 }
 
 impl SavedLink {
@@ -45,6 +54,9 @@ pub fn from_ports(g: &Graph, out_port: u32, in_port: u32) -> Option<SavedLink> {
         in_port: pi.name.clone(),
         enabled: true,
         waypoints: Vec::new(),
+        lingering: false,
+        has_switch: false,
+        switch_pos: None,
     })
 }
 
@@ -109,6 +121,108 @@ pub fn missing(g: &Graph, links: &[SavedLink], requested: &HashSet<(u32, u32)>) 
     out
 }
 
+/// Whether the saved link matching `(out_port, in_port)` is configured to linger after quit.
+pub fn is_lingering(g: &Graph, links: &[SavedLink], out_port: u32, in_port: u32) -> bool {
+    from_ports(g, out_port, in_port)
+        .and_then(|s| find(links, &s))
+        .is_some_and(|i| links[i].lingering)
+}
+
+/// Swap common stereo suffixes/tokens on a port name (`FL`<->`FR`, `_L`<->`_R`, `_1`<->`_2`, `left`<->`right`).
+fn swap_stereo_name(name: &str) -> Option<String> {
+    for (a, b) in [
+        ("_FL", "_FR"),
+        ("_FR", "_FL"),
+        ("FL", "FR"),
+        ("FR", "FL"),
+        ("_L", "_R"),
+        ("_R", "_L"),
+        ("_1", "_2"),
+        ("_2", "_1"),
+        ("_left", "_right"),
+        ("_right", "_left"),
+        ("Left", "Right"),
+        ("Right", "Left"),
+    ] {
+        if let Some(prefix) = name.strip_suffix(a) {
+            return Some(format!("{prefix}{b}"));
+        }
+    }
+    None
+}
+
+/// Find the companion stereo port on `node_id` in direction `dir` for `port_id`.
+fn sibling_stereo_port(g: &Graph, node_id: u32, port_id: u32, dir: Direction) -> Option<u32> {
+    let port = g.ports.get(&port_id)?;
+    let ports = g.ports_of(node_id, dir);
+    if let Some(target_name) = swap_stereo_name(&port.name) {
+        if let Some(p) = ports.iter().find(|p| p.id != port_id && p.name == target_name) {
+            return Some(p.id);
+        }
+    }
+    // Fallback: if the node has exactly 2 ports in this direction, pick the other one.
+    if ports.len() == 2 {
+        return ports.iter().find(|p| p.id != port_id).map(|p| p.id);
+    }
+    None
+}
+
+/// Given a connection `(out_port, in_port)`, find the matching stereo partner pair
+/// `(partner_out_port, partner_in_port)` on the same two nodes, if both exist.
+pub fn stereo_partner_ports(g: &Graph, out_port: u32, in_port: u32) -> Option<(u32, u32)> {
+    let po = g.ports.get(&out_port)?;
+    let pi = g.ports.get(&in_port)?;
+    let out2 = sibling_stereo_port(g, po.node_id, out_port, Direction::Out)?;
+    let in2 = sibling_stereo_port(g, pi.node_id, in_port, Direction::In)?;
+    Some((out2, in2))
+}
+
+/// Pair up output ports of `out_node` with input ports of `in_node` for 1-click stereo/multi-channel routing.
+pub fn stereo_node_pairs(g: &Graph, out_node: u32, in_node: u32) -> Vec<(u32, u32)> {
+    if out_node == in_node {
+        return Vec::new();
+    }
+    let outs = g.ports_of(out_node, Direction::Out);
+    let ins = g.ports_of(in_node, Direction::In);
+    if outs.is_empty() || ins.is_empty() {
+        return Vec::new();
+    }
+    // First try matching FL/FR by channel suffix; otherwise pair in order up to 2 (or min len).
+    let mut pairs = Vec::new();
+    let mut used_in = HashSet::new();
+    for o in &outs {
+        let ch = if o.name.ends_with("FL") || o.name.ends_with("_L") || o.name.ends_with("_1") {
+            Some(0)
+        } else if o.name.ends_with("FR") || o.name.ends_with("_R") || o.name.ends_with("_2") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(ch) = ch {
+            if let Some(i) = ins.iter().find(|i| {
+                !used_in.contains(&i.id)
+                    && ((ch == 0
+                        && (i.name.ends_with("FL")
+                            || i.name.ends_with("_L")
+                            || i.name.ends_with("_1")))
+                        || (ch == 1
+                            && (i.name.ends_with("FR")
+                                || i.name.ends_with("_R")
+                                || i.name.ends_with("_2"))))
+            }) {
+                used_in.insert(i.id);
+                pairs.push((o.id, i.id));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        for (o, i) in outs.iter().zip(ins.iter()) {
+            pairs.push((o.id, i.id));
+        }
+    }
+    pairs
+}
+
 /// Returns external links that should be severed to prevent audio bleed according to `mode`.
 ///
 /// - `ManagedNodes`: severs external links if:
@@ -129,12 +243,12 @@ pub fn bleed_links_to_sever(
     }
     let managed_out: HashSet<&str> = saved_links
         .iter()
-        .filter(|l| l.enabled)
+        .filter(|l| l.enabled || l.has_switch)
         .map(|l| l.out_node.as_str())
         .collect();
     let managed_in: HashSet<&str> = saved_links
         .iter()
-        .filter(|l| l.enabled)
+        .filter(|l| l.enabled || l.has_switch)
         .map(|l| l.in_node.as_str())
         .collect();
 
@@ -218,6 +332,9 @@ mod tests {
             in_port: "input_FL".into(),
             enabled: true,
             waypoints: Vec::new(),
+            lingering: false,
+            has_switch: false,
+            switch_pos: None,
         }
     }
 
@@ -350,6 +467,9 @@ mod tests {
                 in_port: "playback_FL".into(),
                 enabled: true,
                 waypoints: Vec::new(),
+                lingering: false,
+                has_switch: false,
+                switch_pos: None,
             },
             SavedLink {
                 out_node: "Music_Sink".into(),
@@ -358,6 +478,9 @@ mod tests {
                 in_port: "playback_FL".into(),
                 enabled: true,
                 waypoints: Vec::new(),
+                lingering: false,
+                has_switch: false,
+                switch_pos: None,
             },
         ];
 
@@ -386,5 +509,15 @@ mod tests {
         severed.insert(101);
         let to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::ManagedNodes, &severed);
         assert!(to_sever.is_empty());
+    }
+
+    #[test]
+    fn stereo_partner_and_node_pairs() {
+        let mut g = graph();
+        g.apply(port(11, 1, "capture_FR", Direction::Out));
+        g.apply(port(21, 2, "input_FR", Direction::In));
+        assert_eq!(stereo_partner_ports(&g, 10, 20), Some((11, 21)));
+        assert_eq!(stereo_partner_ports(&g, 11, 21), Some((10, 20)));
+        assert_eq!(stereo_node_pairs(&g, 1, 2), vec![(10, 20), (11, 21)]);
     }
 }
