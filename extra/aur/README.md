@@ -1,10 +1,28 @@
-# Publishing RedoxRouter to the Arch User Repository (AUR)
+# Arch Linux Package Setup (AUR & Local Pacman)
 
-No approval is needed! Anyone with an account on [aur.archlinux.org](https://aur.archlinux.org/) can publish an AUR package.
+> [!NOTE]
+> New user registrations on the official AUR are temporarily paused by Arch Linux maintainers due to spam/DDoS attacks on the AUR infrastructure.
+> Users can still build and install pacman-tracked packages locally via `makepkg -si`. Once registrations reopen, follow the instructions below to publish the packages officially.
 
 ---
 
-## 1. Prerequisites (One-Time Setup)
+## Local Installation (Without Official AUR)
+
+Users can install RedoxRouter as a genuine pacman package directly from this repo:
+
+```bash
+# Build from source and install via pacman:
+cd extra/aur/redox-router
+makepkg -si
+
+# Or install from release binary:
+cd extra/aur/redox-router-bin
+makepkg -si
+```
+
+---
+
+## Publishing to AUR (When Registrations Reopen)
 1. Register an account at [https://aur.archlinux.org/register/](https://aur.archlinux.org/register/)
 2. Upload your SSH public key (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`) to **My Account** on aur.archlinux.org.
 3. Test your SSH connection:

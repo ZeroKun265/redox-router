@@ -320,18 +320,27 @@ All configuration is saved atomically (via temporary file + rename) under `~/.co
 
 ## Installation
 
-### Arch Linux (AUR)
-RedoxRouter is available on the Arch User Repository:
+### Arch Linux (Manual Pacman Package / AUR)
+
+> [!NOTE]
+> New user registrations on the official AUR are temporarily suspended by Arch Linux maintainers due to ongoing attacks. As soon as registrations reopen, official AUR packages (`redox-router-bin` / `redox-router`) will be published.
+>
+> In the meantime, you can build and install a clean, pacman-managed package using the included `PKGBUILD`:
 
 ```bash
-# Precompiled binary (fastest, no Rust toolchain needed):
-yay -S redox-router-bin
-# or
-paru -S redox-router-bin
+# Option A: Build from source with makepkg (registered with pacman)
+git clone https://github.com/ZeroKun265/redox-router.git
+cd redox-router/extra/aur/redox-router
+makepkg -si
 
-# Or build from source via AUR:
-yay -S redox-router
+# Option B: Install precompiled binary with makepkg (fastest)
+cd redox-router/extra/aur/redox-router-bin
+makepkg -si
 ```
+
+This installs `redox-router` into `/usr/bin/` with system desktop entry and icons, and tracks it under `pacman` so you can cleanly query or remove it with `sudo pacman -R redox-router`.
+
+*(Once AUR registrations reopen, standard `yay -S redox-router-bin` will be enabled).*
 
 ### Precompiled Binary (Universal Linux)
 Prebuilt tarballs with `.desktop` and icon integration are available on the [GitHub Releases](https://github.com/ZeroKun265/redox-router/releases) page.
