@@ -10,7 +10,7 @@ depends=('pipewire' 'gcc-libs' 'glibc')
 provides=('redox-router')
 conflicts=('redox-router' 'redox-router-git')
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/ZeroKun265/redox-router/releases/download/v${pkgver}/redox-router-x86_64-linux.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('03122086b49dae8744fa0792c897d0b2e05e5eb7cd8dc68e7482af0176291781')
 
 package() {
     install -Dm755 "${srcdir}/redox-router" "${pkgdir}/usr/bin/redox-router"
