@@ -12,7 +12,7 @@ permissions:
 jobs:
   build-release:
     name: Build & Release x86_64-linux
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
