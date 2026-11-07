@@ -19,7 +19,7 @@ use pw::spa::pod::{Object, Pod, Property, Value, ValueArray};
 use std::io::Cursor;
 use pw::properties::properties;
 use pw::types::ObjectType;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
@@ -144,15 +144,18 @@ macro_rules! rlog {
 }
 
 struct OwnedLink {
-    link: Link,
-    global_id: Rc<RefCell<Option<u32>>>,
+    /// MUST be declared before `link` so `spa_hook_remove` runs before `pw_proxy_destroy` frees the C proxy.
     _listener: ProxyListener,
+    link: Link,
+    global_id: Rc<Cell<Option<u32>>>,
+    dead: Rc<Cell<bool>>,
 }
 
 struct OwnedSink {
-    _node: Node,
-    global_id: Rc<RefCell<Option<u32>>>,
+    /// MUST be declared before `_node` so `spa_hook_remove` runs before `pw_proxy_destroy` frees the C proxy.
     _listener: ProxyListener,
+    _node: Node,
+    global_id: Rc<Cell<Option<u32>>>,
 }
 
 fn run(
@@ -220,6 +223,7 @@ fn run(
         };
         let create = |out_node: u32, out_port: u32, in_node: u32, in_port: u32, lingering: bool| {
             let key = (out_port, in_port);
+            owned_links_cmd.borrow_mut().retain(|_, ol| !ol.dead.get());
             if owned_links_cmd.borrow().contains_key(&key) {
                 rlog!("create link {:?}: already in owned_links", key);
                 return;
@@ -235,9 +239,10 @@ fn run(
             };
             match core_cmd.create_object::<Link>("link-factory", &props) {
                 Ok(link) => {
-                    let gid = Rc::new(RefCell::new(None));
+                    let gid = Rc::new(Cell::new(None));
                     let gid_bound = gid.clone();
-                    let owned_links_weak = Rc::downgrade(&owned_links_cmd);
+                    let dead = Rc::new(Cell::new(false));
+                    let dead_rm = dead.clone();
                     let key_clone = key;
 
                     let tx_rm_link = tx_cmd.clone();
@@ -248,13 +253,13 @@ fn run(
                         .add_listener_local()
                         .bound(move |id| {
                             rlog!("owned link {:?} bound to global id {id}", key_clone);
-                            *gid_bound.borrow_mut() = Some(id);
+                            gid_bound.set(Some(id));
                         })
                         .removed(move || {
                             rlog!("owned link {:?} proxy removed by server", key_clone);
-                            if let Some(links) = owned_links_weak.upgrade() {
-                                links.borrow_mut().remove(&key_clone);
-                            }
+                            // Mark dead instead of dropping `OwnedLink` (and its C `pw_proxy`)
+                            // while `libpipewire` is still inside `pw_proxy_removed` on the C stack.
+                            dead_rm.set(true);
                             let _ = tx_rm_link.send(Event::OwnedRemoved {
                                 out_port: key_clone.0,
                                 in_port: key_clone.1,
@@ -266,9 +271,10 @@ fn run(
                     owned_links_cmd.borrow_mut().insert(
                         key,
                         OwnedLink {
+                            _listener: listener,
                             link,
                             global_id: gid,
-                            _listener: listener,
+                            dead,
                         },
                     );
                     notify(Event::OwnedAdded { out_port, in_port });
@@ -306,14 +312,18 @@ fn run(
                 rlog!("command DestroyLink link_id={:?} out_port={} in_port={}", link_id, out_port, in_port);
                 let removed = owned_links_cmd.borrow_mut().remove(&(out_port, in_port));
                 let id_to_destroy =
-                    link_id.or_else(|| removed.as_ref().and_then(|ol| *ol.global_id.borrow()));
+                    link_id.or_else(|| removed.as_ref().and_then(|ol| ol.global_id.get()));
                 if let Some(id) = id_to_destroy {
                     rlog!("destroying link global id {id} via registry");
+                    drop(removed);
                     let _ = registry_cmd.destroy_global(id);
                 } else if let Some(ol) = removed {
                     rlog!("destroying unbound link proxy via core");
-                    let _ = core_cmd.destroy_object(ol.link);
+                    let OwnedLink { _listener, link, .. } = ol;
+                    drop(_listener);
+                    let _ = core_cmd.destroy_object(link);
                 }
+                owned_links_cmd.borrow_mut().retain(|_, ol| !ol.dead.get());
                 notify(Event::OwnedRemoved { out_port, in_port });
             }
             Command::CreateSink { name, description } => {
@@ -330,7 +340,7 @@ fn run(
                 match core_cmd.create_object::<Node>("adapter", &props) {
                     Ok(node) => {
                         rlog!("created virtual sink node proxy, waiting for global bind");
-                        let gid = Rc::new(RefCell::new(None));
+                        let gid = Rc::new(Cell::new(None));
                         let gid_bound = gid.clone();
                         let tx_sink = tx_cmd.clone();
                         let ctx_sink = ctx_cmd.clone();
@@ -340,7 +350,7 @@ fn run(
                             .add_listener_local()
                             .bound(move |id| {
                                 rlog!("owned sink bound to global id {id}");
-                                *gid_bound.borrow_mut() = Some(id);
+                                gid_bound.set(Some(id));
                                 let _ = tx_sink.send(Event::OwnedNodeAdded(id));
                                 ctx_sink.request_repaint();
                             })
@@ -350,9 +360,9 @@ fn run(
                             .register();
 
                         owned_sinks_cmd.borrow_mut().push(OwnedSink {
+                            _listener: listener,
                             _node: node,
                             global_id: gid,
-                            _listener: listener,
                         });
                     }
                     Err(e) => {
@@ -375,7 +385,7 @@ fn run(
                 match core_cmd.create_object::<Node>("adapter", &props) {
                     Ok(node) => {
                         rlog!("created virtual source node proxy, waiting for global bind");
-                        let gid = Rc::new(RefCell::new(None));
+                        let gid = Rc::new(Cell::new(None));
                         let gid_bound = gid.clone();
                         let tx_sink = tx_cmd.clone();
                         let ctx_sink = ctx_cmd.clone();
@@ -385,7 +395,7 @@ fn run(
                             .add_listener_local()
                             .bound(move |id| {
                                 rlog!("owned source bound to global id {id}");
-                                *gid_bound.borrow_mut() = Some(id);
+                                gid_bound.set(Some(id));
                                 let _ = tx_sink.send(Event::OwnedNodeAdded(id));
                                 ctx_sink.request_repaint();
                             })
@@ -395,9 +405,9 @@ fn run(
                             .register();
 
                         owned_sinks_cmd.borrow_mut().push(OwnedSink {
+                            _listener: listener,
                             _node: node,
                             global_id: gid,
-                            _listener: listener,
                         });
                     }
                     Err(e) => {
@@ -409,7 +419,7 @@ fn run(
             Command::DestroySink { node_id } => {
                 rlog!("command DestroySink node_id={node_id}");
                 owned_sinks_cmd.borrow_mut().retain(|os| {
-                    os.global_id.borrow().map_or(true, |gid| gid != node_id)
+                    os.global_id.get() != Some(node_id)
                 });
                 let _ = registry_cmd.destroy_global(node_id);
             }
@@ -479,6 +489,7 @@ fn run(
                             if is_audio {
                                 node.subscribe_params(&[ParamType::Props]);
                             }
+                            listeners_add.borrow_mut().remove(&id);
                             nodes_add.borrow_mut().insert(id, node);
                             listeners_add.borrow_mut().insert(id, Box::new(listener));
                         }
@@ -509,6 +520,7 @@ fn run(
                                 })
                                 .register();
                             dev.subscribe_params(&[ParamType::Route]);
+                            listeners_add.borrow_mut().remove(&id);
                             devices_add.borrow_mut().insert(id, dev);
                             listeners_add.borrow_mut().insert(id, Box::new(listener));
                         }
@@ -525,7 +537,7 @@ fn run(
             devices_rm.borrow_mut().remove(&id);
             nodes_rm.borrow_mut().remove(&id);
             owned_links_rm.borrow_mut().retain(|k, ol| {
-                if ol.global_id.borrow().map_or(false, |gid| gid == id) {
+                if ol.dead.get() || ol.global_id.get() == Some(id) {
                     rlog!("owned_links dropping entry {:?} matching global id {id}", k);
                     false
                 } else {
@@ -533,7 +545,7 @@ fn run(
                 }
             });
             owned_sinks_rm.borrow_mut().retain(|os| {
-                if os.global_id.borrow().map_or(false, |gid| gid == id) {
+                if os.global_id.get() == Some(id) {
                     rlog!("owned_sinks dropping entry matching global id {id}");
                     false
                 } else {
@@ -546,5 +558,10 @@ fn run(
         .register();
 
     main_loop.run();
+    listeners.borrow_mut().clear();
+    owned_links.borrow_mut().clear();
+    owned_sinks.borrow_mut().clear();
+    devices.borrow_mut().clear();
+    nodes.borrow_mut().clear();
     Ok(())
 }

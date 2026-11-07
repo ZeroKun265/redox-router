@@ -682,7 +682,8 @@ impl RedoxRouter {
         };
         for l in links.iter().filter(|l| l.enabled) {
             if let Some((out_port, in_port)) = links::resolve(&self.graph, l) {
-                if !self.requested.contains(&(out_port, in_port)) {
+                let pair = (out_port, in_port);
+                if !self.requested.contains(&pair) && !self.graph.owned_pairs.contains(&pair) {
                     if let Some(live) = self.graph.find_link(out_port, in_port) {
                         self.graph.owned_ids.insert(live.id);
                     }
