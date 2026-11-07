@@ -1744,6 +1744,9 @@ impl RedoxRouter {
                             }
                         }
                     }
+                    if l.stereo_coupled {
+                        ui.label("🔗").on_hover_text("Coupled stereo switch (L+R linked)");
+                    }
                     ui.label(l.label());
                     let state = match links::resolve(&cg, l) {
                         Some((o, n))
@@ -2618,6 +2621,143 @@ impl RedoxRouter {
             self.prompt = None;
         }
     }
+
+    fn stereo_prompts_window(&mut self, ctx: &egui::Context) {
+        // 1. Couple Stereo Switch prompt
+        if let Some(p) = self.canvas.prompt_stereo_switch.clone() {
+            let mut close = false;
+            let mut couple = false;
+            let mut single = false;
+            let (label_a, label_b) = {
+                let l1 = self.canvas.links.get(p.link_idx).map(|l| l.label()).unwrap_or_default();
+                let l2 = self.canvas.links.get(p.partner_idx).map(|l| l.label()).unwrap_or_default();
+                (l1, l2)
+            };
+            egui::Window::new("Couple Stereo Switch?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("RedoxRouter detected a companion stereo connection between these nodes:");
+                    ui.add_space(4.0);
+                    ui.monospace(format!("  Left:  {label_a}"));
+                    ui.monospace(format!("  Right: {label_b}"));
+                    ui.add_space(6.0);
+                    ui.label("Would you like to turn both into a coupled stereo switch that toggles both channels with one click?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Couple Stereo Switch").clicked() {
+                            couple = true;
+                            close = true;
+                        }
+                        if ui.button("This Cable Only").clicked() {
+                            single = true;
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if couple {
+                if let Some(l1) = self.canvas.links.get_mut(p.link_idx) {
+                    l1.has_switch = true;
+                    l1.stereo_coupled = true;
+                    l1.switch_pos = None;
+                }
+                let on = self.canvas.links.get(p.link_idx).map_or(true, |l| l.enabled);
+                if let Some(l2) = self.canvas.links.get_mut(p.partner_idx) {
+                    l2.has_switch = true;
+                    l2.stereo_coupled = true;
+                    l2.switch_pos = None;
+                    l2.enabled = on;
+                }
+                if let Some(pp) = p.partner_pair {
+                    self.handle(Action::SetLinkEnabled {
+                        out_port: pp.0,
+                        in_port: pp.1,
+                        enabled: on,
+                    });
+                }
+                self.canvas.dirty = true;
+            } else if single {
+                if let Some(l1) = self.canvas.links.get_mut(p.link_idx) {
+                    l1.has_switch = true;
+                    l1.stereo_coupled = false;
+                    l1.switch_pos = None;
+                }
+                self.canvas.dirty = true;
+            }
+            if close {
+                self.canvas.prompt_stereo_switch = None;
+            }
+        }
+
+        // 2. Disconnect Stereo Link prompt
+        if let Some(p) = self.canvas.prompt_stereo_disconnect.clone() {
+            let mut close = false;
+            let mut disconnect_both = false;
+            let mut disconnect_single = false;
+            let (label_a, label_b) = {
+                let l1 = self.canvas.links.get(p.link_idx).map(|l| l.label()).unwrap_or_default();
+                let l2 = self.canvas.links.get(p.partner_idx).map(|l| l.label()).unwrap_or_default();
+                (l1, l2)
+            };
+            egui::Window::new("Disconnect Stereo Connection?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("This connection has a matching stereo companion channel:");
+                    ui.add_space(4.0);
+                    ui.monospace(format!("  Channel A: {label_a}"));
+                    ui.monospace(format!("  Channel B: {label_b}"));
+                    ui.add_space(6.0);
+                    ui.label("Do you want to disconnect both channels together, or only this one?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Disconnect Both (Stereo)").clicked() {
+                            disconnect_both = true;
+                            close = true;
+                        }
+                        if ui.button("Disconnect This Channel Only").clicked() {
+                            disconnect_single = true;
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if disconnect_both {
+                self.handle(Action::Disconnect {
+                    out_port: p.pair.0,
+                    in_port: p.pair.1,
+                });
+                if let Some(pp) = p.partner_pair {
+                    self.handle(Action::Disconnect {
+                        out_port: pp.0,
+                        in_port: pp.1,
+                    });
+                } else if let Some(partner_link) = self.canvas.links.get(p.partner_idx).cloned() {
+                    let _ = links::remove(&mut self.canvas.links, &partner_link);
+                    self.canvas.dirty = true;
+                }
+            } else if disconnect_single {
+                self.handle(Action::Disconnect {
+                    out_port: p.pair.0,
+                    in_port: p.pair.1,
+                });
+                if let Some(l2) = self.canvas.links.get_mut(p.partner_idx) {
+                    l2.stereo_coupled = false;
+                    self.canvas.dirty = true;
+                }
+            }
+            if close {
+                self.canvas.prompt_stereo_disconnect = None;
+            }
+        }
+    }
 }
 
 /// Something the user asked for in the Rules window, applied after drawing.
@@ -3199,8 +3339,12 @@ impl eframe::App for RedoxRouter {
         for (out_port, in_port) in std::mem::take(&mut self.canvas.extra_disconnects) {
             self.handle(Action::Disconnect { out_port, in_port });
         }
+        for (out_port, in_port, enabled) in std::mem::take(&mut self.canvas.extra_enables) {
+            self.handle(Action::SetLinkEnabled { out_port, in_port, enabled });
+        }
 
         self.prompt_window(ctx);
+        self.stereo_prompts_window(ctx);
         self.rules_window(ctx);
         self.links_window(ctx);
         self.theme_window(ctx);

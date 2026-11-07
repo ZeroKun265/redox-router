@@ -29,6 +29,9 @@ pub struct SavedLink {
     /// Optional world position `(x, y)` of the switch box; when `None`, sits at the cable midpoint.
     #[serde(default)]
     pub switch_pos: Option<(f32, f32)>,
+    /// When true, this switch is coupled to its companion stereo channel (L+R toggle in lockstep).
+    #[serde(default)]
+    pub stereo_coupled: bool,
 }
 
 impl SavedLink {
@@ -57,6 +60,7 @@ pub fn from_ports(g: &Graph, out_port: u32, in_port: u32) -> Option<SavedLink> {
         lingering: false,
         has_switch: false,
         switch_pos: None,
+        stereo_coupled: false,
     })
 }
 
@@ -176,6 +180,62 @@ pub fn stereo_partner_ports(g: &Graph, out_port: u32, in_port: u32) -> Option<(u
     let out2 = sibling_stereo_port(g, po.node_id, out_port, Direction::Out)?;
     let in2 = sibling_stereo_port(g, pi.node_id, in_port, Direction::In)?;
     Some((out2, in2))
+}
+
+/// Find the companion stereo link in `links` matching `link` by node names and swapped port stereo names.
+pub fn find_stereo_partner(links: &[SavedLink], link: &SavedLink) -> Option<usize> {
+    let out_target = swap_stereo_name(&link.out_port)?;
+    let in_target = swap_stereo_name(&link.in_port)?;
+    links.iter().position(|l| {
+        l.out_node == link.out_node
+            && l.in_node == link.in_node
+            && l.out_port == out_target
+            && l.in_port == in_target
+    })
+}
+
+/// Find the companion stereo link index for `links[idx]`, checking by port naming
+/// and falling back to live Graph port pairings if available.
+pub fn find_stereo_partner_idx(links: &[SavedLink], idx: usize, g: Option<&Graph>) -> Option<usize> {
+    let l = links.get(idx)?;
+    if let Some(pos) = find_stereo_partner(links, l) {
+        if pos != idx {
+            return Some(pos);
+        }
+    }
+    if let Some(g) = g {
+        if let Some((po, pi)) = resolve(g, l) {
+            if let Some((out2, in2)) = stereo_partner_ports(g, po, pi) {
+                if let Some(target_saved) = from_ports(g, out2, in2) {
+                    return links.iter().position(|x| x.same_ends(&target_saved) && x != l);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Guess channel label ("L" or "R") from port name if recognized.
+pub fn channel_label(port_name: &str) -> Option<&'static str> {
+    for (suf, ch) in [
+        ("_FL", "L"),
+        ("_FR", "R"),
+        ("FL", "L"),
+        ("FR", "R"),
+        ("_L", "L"),
+        ("_R", "R"),
+        ("_1", "L"),
+        ("_2", "R"),
+        ("_left", "L"),
+        ("_right", "R"),
+        ("Left", "L"),
+        ("Right", "R"),
+    ] {
+        if port_name.ends_with(suf) {
+            return Some(ch);
+        }
+    }
+    None
 }
 
 /// Pair up output ports of `out_node` with input ports of `in_node` for 1-click stereo/multi-channel routing.
@@ -370,6 +430,7 @@ mod tests {
             lingering: false,
             has_switch: false,
             switch_pos: None,
+            stereo_coupled: false,
         }
     }
 
@@ -505,6 +566,7 @@ mod tests {
                 lingering: false,
                 has_switch: false,
                 switch_pos: None,
+                stereo_coupled: false,
             },
             SavedLink {
                 out_node: "Music_Sink".into(),
@@ -516,6 +578,7 @@ mod tests {
                 lingering: false,
                 has_switch: false,
                 switch_pos: None,
+                stereo_coupled: false,
             },
         ];
 
@@ -564,6 +627,7 @@ mod tests {
             lingering: false,
             has_switch: false,
             switch_pos: None,
+            stereo_coupled: false,
         });
         let to_sever = bleed_links_to_sever(&g, &updated_saved, AutoConnectPrevention::ManagedNodes, &all, &info);
         assert_eq!(to_sever, vec![(101, 10, 30)]);
@@ -603,5 +667,38 @@ mod tests {
         assert_eq!(stereo_partner_ports(&g, 10, 20), Some((11, 21)));
         assert_eq!(stereo_partner_ports(&g, 11, 21), Some((10, 20)));
         assert_eq!(stereo_node_pairs(&g, 1, 2), vec![(10, 20), (11, 21)]);
+    }
+
+    #[test]
+    fn stereo_partner_saved_link_lookup() {
+        let l1 = SavedLink {
+            out_node: "spotify".into(),
+            out_port: "output_FL".into(),
+            in_node: "speakers".into(),
+            in_port: "playback_FL".into(),
+            enabled: true,
+            waypoints: Vec::new(),
+            lingering: false,
+            has_switch: true,
+            switch_pos: None,
+            stereo_coupled: true,
+        };
+        let l2 = SavedLink {
+            out_node: "spotify".into(),
+            out_port: "output_FR".into(),
+            in_node: "speakers".into(),
+            in_port: "playback_FR".into(),
+            enabled: true,
+            waypoints: Vec::new(),
+            lingering: false,
+            has_switch: true,
+            switch_pos: None,
+            stereo_coupled: true,
+        };
+        let links = vec![l1, l2];
+        assert_eq!(find_stereo_partner_idx(&links, 0, None), Some(1));
+        assert_eq!(find_stereo_partner_idx(&links, 1, None), Some(0));
+        assert_eq!(channel_label("output_FL"), Some("L"));
+        assert_eq!(channel_label("output_FR"), Some("R"));
     }
 }

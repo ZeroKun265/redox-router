@@ -76,6 +76,11 @@ New nodes are automatically sorted into three logical columns based on their Pip
   - Right-click any owned cable and select **Make switch** (or tick `switch` in the **Saved links** window) to attach an interactive **ON/OFF toggle switch** directly onto the cable.
   - **Visual Signal Flow**: The first half of a switch cable (from the output port up to the switch box) stays lit and animated with flowing dots, showing signal arriving at the switch. When toggled **ON**, the second half lights up and flows into the destination port. When toggled **OFF**, the live PipeWire link is severed while the cable remains on screen with a dimmed second half, ready to be toggled back on with a single click.
   - **Draggable Switch Placement**: Drag the switch box anywhere on the canvas to position your switches like a physical control board, or right-click the switch and select **Reset switch position** to snap it back to the cable's midpoint.
+  - **Coupled Stereo Switches & Synchronization**:
+    - When adding a switch to a stereo connection (e.g., `FL` and `FR`), RedoxRouter automatically detects the companion channel and prompts to **Couple Stereo Switch** with 1 click.
+    - Coupled switches display channel indicators (`L` and `R`) and are tethered by a visual `🔗` stereo bridge. Clicking either switch toggles both channels in lockstep, and dragging either switch moves both in sync.
+    - Right-clicking gives options to toggle both channels, decouple into independent single switches, or remove both.
+    - When disconnecting or deleting a stereo connection (via right-click or `Delete` key), RedoxRouter prompts you to choose whether to **Disconnect Both (Stereo)** or **Disconnect This Channel Only** (and decouple).
 
 ---
 

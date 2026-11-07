@@ -190,6 +190,23 @@ struct Pending {
     from_out: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct StereoSwitchPromptData {
+    pub link_idx: usize,
+    pub partner_idx: usize,
+    #[allow(dead_code)]
+    pub pair: (u32, u32),
+    pub partner_pair: Option<(u32, u32)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StereoDisconnectPromptData {
+    pub link_idx: usize,
+    pub partner_idx: usize,
+    pub pair: (u32, u32),
+    pub partner_pair: Option<(u32, u32)>,
+}
+
 pub struct Canvas {
     /// Saved links (by name); filled by the app, persisted with the layout.
     pub links: Vec<crate::links::SavedLink>,
@@ -240,6 +257,12 @@ pub struct Canvas {
     pub extra_disconnects: Vec<(u32, u32)>,
     /// Extra links the user asked to connect (e.g. Shift+drag stereo pair or "Connect stereo to…").
     pub extra_connects: Vec<(u32, u32)>,
+    /// Extra links whose enabled state changed (e.g. companion stereo switch).
+    pub extra_enables: Vec<(u32, u32, bool)>,
+    /// Prompt requesting confirmation to couple with companion stereo switch.
+    pub prompt_stereo_switch: Option<StereoSwitchPromptData>,
+    /// Prompt requesting confirmation when disconnecting companion stereo link.
+    pub prompt_stereo_disconnect: Option<StereoDisconnectPromptData>,
     /// Per-setup virtual sinks and microphones.
     pub virtual_devices: Vec<crate::storage::SavedSink>,
     /// Snap nodes, blocks, comments, and waypoints to the grid (or hold Ctrl).
@@ -302,6 +325,9 @@ impl Default for Canvas {
             box_start: None,
             extra_disconnects: Vec::new(),
             extra_connects: Vec::new(),
+            extra_enables: Vec::new(),
+            prompt_stereo_switch: None,
+            prompt_stereo_disconnect: None,
             virtual_devices: Vec::new(),
             snap_to_grid: false,
             show_minimap: true,
@@ -1480,7 +1506,8 @@ impl Canvas {
         let to_screen = |w: (f32, f32)| origin + vec2(w.0, w.1) * z;
         let mut selectable: HashSet<(u32, u32)> = HashSet::new();
         let mut handles: Vec<(usize, usize, Pos2)> = Vec::new();
-        let mut switch_handles: Vec<(usize, (u32, u32), Pos2, bool, bool)> = Vec::new();
+        let mut switch_handles: Vec<(usize, (u32, u32), Pos2, bool, bool, bool)> = Vec::new();
+        let mut sw_positions: HashMap<usize, Pos2> = HashMap::new();
         for (pair, owned) in pairs {
             if !(owned || self.show_external || self.revealed.contains(&pair)) {
                 continue;
@@ -1570,7 +1597,9 @@ impl Canvas {
                     painter.add(Shape::line(pts_after, stroke_after));
                 }
 
-                switch_handles.push((sidx, pair, sw_mid, switch_on, picked));
+                let is_coupled = self.links[sidx].stereo_coupled;
+                sw_positions.insert(sidx, sw_mid);
+                switch_handles.push((sidx, pair, sw_mid, switch_on, picked, is_coupled));
                 shapes.push((pair, pts_all));
             } else {
                 let pts = link_path(self.link_style, *a, &wps, *b, z, pair.0);
@@ -1660,10 +1689,46 @@ impl Canvas {
         }
 
         // Inline switch boxes on switch cables: click to toggle ON/OFF, drag to reposition.
-        for (sidx, pair, sw_pos, sw_on, picked) in switch_handles {
-            let zz = z.clamp(0.75, 1.3);
+        let zz = z.clamp(0.75, 1.3);
+
+        // Draw connecting bridge between companion stereo switches
+        for &(sidx, _, sw_pos, _, _, is_coupled) in &switch_handles {
+            if is_coupled {
+                if let Some(pidx) = crate::links::find_stereo_partner_idx(&self.links, sidx, Some(g)) {
+                    if sidx < pidx {
+                        if let Some(&p_pos) = sw_positions.get(&pidx) {
+                            let bridge_col = self.theme.c_cable_switch().gamma_multiply(0.65);
+                            let stroke = Stroke::new((1.5 * zz).max(1.0), bridge_col);
+                            painter.line_segment([sw_pos, p_pos], stroke);
+                            let mid = pos2((sw_pos.x + p_pos.x) * 0.5, (sw_pos.y + p_pos.y) * 0.5);
+                            let badge_size = vec2(16.0, 14.0) * zz;
+                            let badge_rect = Rect::from_center_size(mid, badge_size);
+                            painter.rect_filled(badge_rect, CornerRadius::same(3), self.theme.c_node_body());
+                            painter.rect_stroke(badge_rect, CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+                            painter.text(mid, egui::Align2::CENTER_CENTER, "🔗", egui::FontId::proportional(9.0 * zz), self.theme.c_node_text());
+                        }
+                    }
+                }
+            }
+        }
+
+        for (sidx, pair, sw_pos, sw_on, picked, is_coupled) in switch_handles {
             let sw_size = vec2(32.0, 16.0) * zz;
             let sw_rect = Rect::from_center_size(sw_pos, sw_size);
+            let partner_idx = crate::links::find_stereo_partner_idx(&self.links, sidx, Some(g));
+            let tip = if is_coupled {
+                if sw_on {
+                    "Stereo Switch (Coupled) is ON: click to turn both L+R off, drag to move"
+                } else {
+                    "Stereo Switch (Coupled) is OFF: click to turn both L+R on, drag to move"
+                }
+            } else {
+                if sw_on {
+                    "Switch is ON: click to turn off, drag to move"
+                } else {
+                    "Switch is OFF: click to turn on, drag to move"
+                }
+            };
             let resp = ui
                 .interact(
                     sw_rect.expand(2.0),
@@ -1671,11 +1736,7 @@ impl Canvas {
                     Sense::click_and_drag(),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if sw_on {
-                    "Switch is ON: click to turn off, drag to move"
-                } else {
-                    "Switch is OFF: click to turn on, drag to move"
-                });
+                .on_hover_text(tip);
             handle_hit |= resp.hovered() || resp.dragged();
             if resp.clicked() {
                 let new_on = !sw_on;
@@ -1688,6 +1749,17 @@ impl Canvas {
                     in_port: pair.1,
                     enabled: new_on,
                 });
+                if is_coupled {
+                    if let Some(pidx) = partner_idx {
+                        if self.links.get(pidx).is_some_and(|l| l.stereo_coupled) {
+                            self.links[pidx].enabled = new_on;
+                            self.dirty = true;
+                            if let Some(pp) = crate::links::resolve(g, &self.links[pidx]) {
+                                self.extra_enables.push((pp.0, pp.1, new_on));
+                            }
+                        }
+                    }
+                }
             }
             if resp.dragged_by(egui::PointerButton::Primary) {
                 let d = resp.drag_delta() / z;
@@ -1703,6 +1775,25 @@ impl Canvas {
                     l.switch_pos = Some((cur.0 + d.x, cur.1 + d.y));
                     self.dirty = true;
                 }
+                if is_coupled {
+                    if let Some(pidx) = partner_idx {
+                        if self.links.get(pidx).is_some_and(|l| l.stereo_coupled) {
+                            let p_pos = sw_positions.get(&pidx).copied().unwrap_or(sw_pos);
+                            let p_cur = self
+                                .links
+                                .get(pidx)
+                                .and_then(|l| l.switch_pos)
+                                .unwrap_or_else(|| {
+                                    let w = (p_pos - origin) / z;
+                                    (w.x, w.y)
+                                });
+                            if let Some(pl) = self.links.get_mut(pidx) {
+                                pl.switch_pos = Some((p_cur.0 + d.x, p_cur.1 + d.y));
+                                self.dirty = true;
+                            }
+                        }
+                    }
+                }
             }
             if resp.drag_stopped_by(egui::PointerButton::Primary) && snap_active {
                 if let Some(l) = self.links.get_mut(sidx) {
@@ -1711,58 +1802,228 @@ impl Canvas {
                         self.dirty = true;
                     }
                 }
-            }
-            resp.context_menu(|ui| {
-                if ui
-                    .button(if sw_on { "Turn switch off" } else { "Turn switch on" })
-                    .clicked()
-                {
-                    let new_on = !sw_on;
-                    if let Some(l) = self.links.get_mut(sidx) {
-                        l.enabled = new_on;
-                        self.dirty = true;
-                    }
-                    action = Some(Action::SetLinkEnabled {
-                        out_port: pair.0,
-                        in_port: pair.1,
-                        enabled: new_on,
-                    });
-                    ui.close_menu();
-                }
-                let has_custom_pos = self.links.get(sidx).is_some_and(|l| l.switch_pos.is_some());
-                if ui
-                    .add_enabled(has_custom_pos, egui::Button::new("Reset switch position"))
-                    .clicked()
-                {
-                    if let Some(l) = self.links.get_mut(sidx) {
-                        l.switch_pos = None;
-                        self.dirty = true;
-                    }
-                    ui.close_menu();
-                }
-                if ui.button("Remove switch").clicked() {
-                    if let Some(l) = self.links.get_mut(sidx) {
-                        let was_off = !l.enabled;
-                        l.has_switch = false;
-                        l.switch_pos = None;
-                        l.enabled = true;
-                        self.dirty = true;
-                        if was_off {
-                            action = Some(Action::SetLinkEnabled {
-                                out_port: pair.0,
-                                in_port: pair.1,
-                                enabled: true,
-                            });
+                if is_coupled {
+                    if let Some(pidx) = partner_idx {
+                        if let Some(pl) = self.links.get_mut(pidx) {
+                            if let Some(sp) = pl.switch_pos {
+                                pl.switch_pos = Some(layout::snap_pos(sp, grid_unit));
+                                self.dirty = true;
+                            }
                         }
                     }
-                    ui.close_menu();
+                }
+            }
+            resp.context_menu(|ui| {
+                if is_coupled {
+                    if ui
+                        .button(if sw_on { "Turn stereo switch off" } else { "Turn stereo switch on" })
+                        .clicked()
+                    {
+                        let new_on = !sw_on;
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            l.enabled = new_on;
+                            self.dirty = true;
+                        }
+                        action = Some(Action::SetLinkEnabled {
+                            out_port: pair.0,
+                            in_port: pair.1,
+                            enabled: new_on,
+                        });
+                        if let Some(pidx) = partner_idx {
+                            if self.links.get(pidx).is_some_and(|l| l.stereo_coupled) {
+                                self.links[pidx].enabled = new_on;
+                                self.dirty = true;
+                                if let Some(pp) = crate::links::resolve(g, &self.links[pidx]) {
+                                    self.extra_enables.push((pp.0, pp.1, new_on));
+                                }
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Decouple stereo switch")
+                        .on_hover_text("Allow each channel to be switched independently")
+                        .clicked()
+                    {
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            l.stereo_coupled = false;
+                            self.dirty = true;
+                        }
+                        if let Some(pidx) = partner_idx {
+                            if let Some(pl) = self.links.get_mut(pidx) {
+                                pl.stereo_coupled = false;
+                                self.dirty = true;
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    let has_custom_pos = self.links.get(sidx).is_some_and(|l| l.switch_pos.is_some())
+                        || partner_idx.is_some_and(|p| self.links.get(p).is_some_and(|l| l.switch_pos.is_some()));
+                    if ui
+                        .add_enabled(has_custom_pos, egui::Button::new("Reset switch positions"))
+                        .clicked()
+                    {
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            l.switch_pos = None;
+                            self.dirty = true;
+                        }
+                        if let Some(pidx) = partner_idx {
+                            if let Some(pl) = self.links.get_mut(pidx) {
+                                pl.switch_pos = None;
+                                self.dirty = true;
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Remove stereo switch (both channels)").clicked() {
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            let was_off = !l.enabled;
+                            l.has_switch = false;
+                            l.stereo_coupled = false;
+                            l.switch_pos = None;
+                            l.enabled = true;
+                            self.dirty = true;
+                            if was_off {
+                                action = Some(Action::SetLinkEnabled {
+                                    out_port: pair.0,
+                                    in_port: pair.1,
+                                    enabled: true,
+                                });
+                            }
+                        }
+                        if let Some(pidx) = partner_idx {
+                            if let Some(pl) = self.links.get_mut(pidx) {
+                                let p_was_off = !pl.enabled;
+                                pl.has_switch = false;
+                                pl.stereo_coupled = false;
+                                pl.switch_pos = None;
+                                pl.enabled = true;
+                                self.dirty = true;
+                                if p_was_off {
+                                    if let Some(pp) = crate::links::resolve(g, pl) {
+                                        self.extra_enables.push((pp.0, pp.1, true));
+                                    }
+                                }
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Remove switch (this channel only)").clicked() {
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            let was_off = !l.enabled;
+                            l.has_switch = false;
+                            l.stereo_coupled = false;
+                            l.switch_pos = None;
+                            l.enabled = true;
+                            self.dirty = true;
+                            if was_off {
+                                action = Some(Action::SetLinkEnabled {
+                                    out_port: pair.0,
+                                    in_port: pair.1,
+                                    enabled: true,
+                                });
+                            }
+                        }
+                        if let Some(pidx) = partner_idx {
+                            if let Some(pl) = self.links.get_mut(pidx) {
+                                pl.stereo_coupled = false;
+                                self.dirty = true;
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                } else {
+                    if let Some(pidx) = partner_idx {
+                        if self.links.get(pidx).is_some_and(|l| l.has_switch) {
+                            if ui
+                                .button("Couple with companion stereo switch")
+                                .on_hover_text("Lock L+R switches together to toggle both in 1 click")
+                                .clicked()
+                            {
+                                if let Some(l) = self.links.get_mut(sidx) {
+                                    l.stereo_coupled = true;
+                                    self.dirty = true;
+                                }
+                                if let Some(pl) = self.links.get_mut(pidx) {
+                                    pl.stereo_coupled = true;
+                                    pl.enabled = sw_on;
+                                    self.dirty = true;
+                                    if let Some(pp) = crate::links::resolve(g, pl) {
+                                        self.extra_enables.push((pp.0, pp.1, sw_on));
+                                    }
+                                }
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                        }
+                    }
+                    if ui
+                        .button(if sw_on { "Turn switch off" } else { "Turn switch on" })
+                        .clicked()
+                    {
+                        let new_on = !sw_on;
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            l.enabled = new_on;
+                            self.dirty = true;
+                        }
+                        action = Some(Action::SetLinkEnabled {
+                            out_port: pair.0,
+                            in_port: pair.1,
+                            enabled: new_on,
+                        });
+                        ui.close_menu();
+                    }
+                    let has_custom_pos = self.links.get(sidx).is_some_and(|l| l.switch_pos.is_some());
+                    if ui
+                        .add_enabled(has_custom_pos, egui::Button::new("Reset switch position"))
+                        .clicked()
+                    {
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            l.switch_pos = None;
+                            self.dirty = true;
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Remove switch").clicked() {
+                        if let Some(l) = self.links.get_mut(sidx) {
+                            let was_off = !l.enabled;
+                            l.has_switch = false;
+                            l.switch_pos = None;
+                            l.enabled = true;
+                            self.dirty = true;
+                            if was_off {
+                                action = Some(Action::SetLinkEnabled {
+                                    out_port: pair.0,
+                                    in_port: pair.1,
+                                    enabled: true,
+                                });
+                            }
+                        }
+                        ui.close_menu();
+                    }
                 }
                 ui.separator();
                 if ui.button("Delete link").clicked() {
-                    action = Some(Action::Disconnect {
-                        out_port: pair.0,
-                        in_port: pair.1,
-                    });
+                    let mut prompted = false;
+                    if let Some(pidx) = partner_idx {
+                        let partner_pair = crate::links::resolve(g, &self.links[pidx]);
+                        let partner_connected = partner_pair.is_some_and(|(po, pi)| g.find_link(po, pi).is_some());
+                        if is_coupled || partner_connected {
+                            self.prompt_stereo_disconnect = Some(StereoDisconnectPromptData {
+                                link_idx: sidx,
+                                partner_idx: pidx,
+                                pair,
+                                partner_pair,
+                            });
+                            prompted = true;
+                        }
+                    }
+                    if !prompted {
+                        action = Some(Action::Disconnect {
+                            out_port: pair.0,
+                            in_port: pair.1,
+                        });
+                    }
                     self.selected = None;
                     ui.close_menu();
                 }
@@ -1813,6 +2074,29 @@ impl Canvas {
                 sw_size.y * 0.34,
                 knob_col,
             );
+
+            // Channel indicator ("L" / "R") inside switch pill
+            let ch_tag = crate::links::channel_label(&self.links[sidx].out_port);
+            if let Some(tag) = ch_tag {
+                let tag_x = if sw_on {
+                    sw_rect.min.x + sw_size.y * 0.45
+                } else {
+                    sw_rect.max.x - sw_size.y * 0.45
+                };
+                let tag_pos = pos2(tag_x, sw_rect.center().y);
+                let tag_col = if sw_on {
+                    Color32::WHITE
+                } else {
+                    Color32::from_gray(if self.theme.is_dark { 165 } else { 125 })
+                };
+                painter.text(
+                    tag_pos,
+                    egui::Align2::CENTER_CENTER,
+                    tag,
+                    egui::FontId::monospace((10.0 * zz).clamp(8.0, 14.0)),
+                    tag_col,
+                );
+            }
         }
 
         // Double-click on one of our links adds a waypoint there.
@@ -1875,53 +2159,151 @@ impl Canvas {
                     let saved_idx = crate::links::from_ports(g, pair.0, pair.1)
                         .and_then(|s| crate::links::find(&self.links, &s));
                     if let Some(i) = saved_idx {
+                        let is_coupled = self.links[i].stereo_coupled;
+                        let partner_idx = crate::links::find_stereo_partner_idx(&self.links, i, Some(g));
                         if !self.links[i].has_switch {
                             if ui
                                 .button("Make switch")
                                 .on_hover_text("Add an inline on/off switch box on this connection")
                                 .clicked()
                             {
-                                self.links[i].has_switch = true;
-                                self.links[i].switch_pos = None;
-                                self.dirty = true;
+                                if let Some(pidx) = partner_idx {
+                                    let partner_pair = crate::links::resolve(g, &self.links[pidx]);
+                                    self.prompt_stereo_switch = Some(StereoSwitchPromptData {
+                                        link_idx: i,
+                                        partner_idx: pidx,
+                                        pair,
+                                        partner_pair,
+                                    });
+                                } else {
+                                    self.links[i].has_switch = true;
+                                    self.links[i].stereo_coupled = false;
+                                    self.links[i].switch_pos = None;
+                                    self.dirty = true;
+                                }
                                 ui.close_menu();
                             }
                         } else {
-                            let on = self.links[i].enabled;
-                            if ui
-                                .button(if on { "Turn switch off" } else { "Turn switch on" })
-                                .clicked()
-                            {
-                                self.links[i].enabled = !on;
-                                self.dirty = true;
-                                action = Some(Action::SetLinkEnabled {
-                                    out_port: pair.0,
-                                    in_port: pair.1,
-                                    enabled: !on,
-                                });
-                                ui.close_menu();
-                            }
-                            if self.links[i].switch_pos.is_some()
-                                && ui.button("Reset switch position").clicked()
-                            {
-                                self.links[i].switch_pos = None;
-                                self.dirty = true;
-                                ui.close_menu();
-                            }
-                            if ui.button("Remove switch").clicked() {
-                                let was_off = !self.links[i].enabled;
-                                self.links[i].has_switch = false;
-                                self.links[i].switch_pos = None;
-                                self.links[i].enabled = true;
-                                self.dirty = true;
-                                if was_off {
+                            if is_coupled {
+                                let on = self.links[i].enabled;
+                                if ui
+                                    .button(if on { "Turn stereo switch off" } else { "Turn stereo switch on" })
+                                    .clicked()
+                                {
+                                    let new_on = !on;
+                                    self.links[i].enabled = new_on;
+                                    self.dirty = true;
                                     action = Some(Action::SetLinkEnabled {
                                         out_port: pair.0,
                                         in_port: pair.1,
-                                        enabled: true,
+                                        enabled: new_on,
                                     });
+                                    if let Some(pidx) = partner_idx {
+                                        if self.links.get(pidx).is_some_and(|l| l.stereo_coupled) {
+                                            self.links[pidx].enabled = new_on;
+                                            self.dirty = true;
+                                            if let Some(pp) = crate::links::resolve(g, &self.links[pidx]) {
+                                                self.extra_enables.push((pp.0, pp.1, new_on));
+                                            }
+                                        }
+                                    }
+                                    ui.close_menu();
                                 }
-                                ui.close_menu();
+                                if ui.button("Decouple stereo switch").clicked() {
+                                    self.links[i].stereo_coupled = false;
+                                    if let Some(pidx) = partner_idx {
+                                        if let Some(pl) = self.links.get_mut(pidx) {
+                                            pl.stereo_coupled = false;
+                                        }
+                                    }
+                                    self.dirty = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Remove stereo switch (both channels)").clicked() {
+                                    let was_off = !self.links[i].enabled;
+                                    self.links[i].has_switch = false;
+                                    self.links[i].stereo_coupled = false;
+                                    self.links[i].switch_pos = None;
+                                    self.links[i].enabled = true;
+                                    self.dirty = true;
+                                    if was_off {
+                                        action = Some(Action::SetLinkEnabled {
+                                            out_port: pair.0,
+                                            in_port: pair.1,
+                                            enabled: true,
+                                        });
+                                    }
+                                    if let Some(pidx) = partner_idx {
+                                        if let Some(pl) = self.links.get_mut(pidx) {
+                                            let p_was_off = !pl.enabled;
+                                            pl.has_switch = false;
+                                            pl.stereo_coupled = false;
+                                            pl.switch_pos = None;
+                                            pl.enabled = true;
+                                            self.dirty = true;
+                                            if p_was_off {
+                                                if let Some(pp) = crate::links::resolve(g, pl) {
+                                                    self.extra_enables.push((pp.0, pp.1, true));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ui.close_menu();
+                                }
+                            } else {
+                                if let Some(pidx) = partner_idx {
+                                    if self.links.get(pidx).is_some_and(|l| l.has_switch) {
+                                        if ui.button("Couple with companion stereo switch").clicked() {
+                                            let on = self.links[i].enabled;
+                                            self.links[i].stereo_coupled = true;
+                                            if let Some(pl) = self.links.get_mut(pidx) {
+                                                pl.stereo_coupled = true;
+                                                pl.enabled = on;
+                                                if let Some(pp) = crate::links::resolve(g, pl) {
+                                                    self.extra_enables.push((pp.0, pp.1, on));
+                                                }
+                                            }
+                                            self.dirty = true;
+                                            ui.close_menu();
+                                        }
+                                    }
+                                }
+                                let on = self.links[i].enabled;
+                                if ui
+                                    .button(if on { "Turn switch off" } else { "Turn switch on" })
+                                    .clicked()
+                                {
+                                    self.links[i].enabled = !on;
+                                    self.dirty = true;
+                                    action = Some(Action::SetLinkEnabled {
+                                        out_port: pair.0,
+                                        in_port: pair.1,
+                                        enabled: !on,
+                                    });
+                                    ui.close_menu();
+                                }
+                                if self.links[i].switch_pos.is_some()
+                                    && ui.button("Reset switch position").clicked()
+                                {
+                                    self.links[i].switch_pos = None;
+                                    self.dirty = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Remove switch").clicked() {
+                                    let was_off = !self.links[i].enabled;
+                                    self.links[i].has_switch = false;
+                                    self.links[i].switch_pos = None;
+                                    self.links[i].enabled = true;
+                                    self.dirty = true;
+                                    if was_off {
+                                        action = Some(Action::SetLinkEnabled {
+                                            out_port: pair.0,
+                                            in_port: pair.1,
+                                            enabled: true,
+                                        });
+                                    }
+                                    ui.close_menu();
+                                }
                             }
                         }
                         ui.separator();
@@ -1966,10 +2348,28 @@ impl Canvas {
                     }
                     ui.separator();
                     if ui.button("Delete link").clicked() {
-                        action = Some(Action::Disconnect {
-                            out_port: pair.0,
-                            in_port: pair.1,
-                        });
+                        let mut prompted = false;
+                        if let Some(i) = saved_idx {
+                            if let Some(pidx) = crate::links::find_stereo_partner_idx(&self.links, i, Some(g)) {
+                                let partner_pair = crate::links::resolve(g, &self.links[pidx]);
+                                let partner_connected = partner_pair.is_some_and(|(po, pi)| g.find_link(po, pi).is_some());
+                                if self.links[i].stereo_coupled || partner_connected {
+                                    self.prompt_stereo_disconnect = Some(StereoDisconnectPromptData {
+                                        link_idx: i,
+                                        partner_idx: pidx,
+                                        pair,
+                                        partner_pair,
+                                    });
+                                    prompted = true;
+                                }
+                            }
+                        }
+                        if !prompted {
+                            action = Some(Action::Disconnect {
+                                out_port: pair.0,
+                                in_port: pair.1,
+                            });
+                        }
                         self.selected = None;
                         ui.close_menu();
                     }
@@ -2160,7 +2560,27 @@ impl Canvas {
                     || selectable.contains(&pair)
                     || g.find_link(pair.0, pair.1).is_some_and(|l| g.is_owned(l));
                 if owned {
-                    action = Some(Action::Disconnect { out_port: pair.0, in_port: pair.1 });
+                    let mut prompted = false;
+                    let saved_idx = crate::links::from_ports(g, pair.0, pair.1)
+                        .and_then(|s| crate::links::find(&self.links, &s));
+                    if let Some(i) = saved_idx {
+                        if let Some(p_idx) = crate::links::find_stereo_partner_idx(&self.links, i, Some(g)) {
+                            let partner_pair = crate::links::resolve(g, &self.links[p_idx]);
+                            let partner_connected = partner_pair.is_some_and(|(po, pi)| g.find_link(po, pi).is_some());
+                            if self.links[i].stereo_coupled || partner_connected {
+                                self.prompt_stereo_disconnect = Some(StereoDisconnectPromptData {
+                                    link_idx: i,
+                                    partner_idx: p_idx,
+                                    pair,
+                                    partner_pair,
+                                });
+                                prompted = true;
+                            }
+                        }
+                    }
+                    if !prompted {
+                        action = Some(Action::Disconnect { out_port: pair.0, in_port: pair.1 });
+                    }
                     self.selected = None;
                 }
             }
