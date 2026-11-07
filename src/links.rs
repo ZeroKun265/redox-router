@@ -113,6 +113,7 @@ pub fn missing(g: &Graph, links: &[SavedLink], requested: &HashSet<(u32, u32)>) 
             || g.owned_pairs.contains(&pair)
             || requested.contains(&pair)
             || out.contains(&pair)
+            || !g.can_link_ports(pair.0, pair.1)
         {
             continue;
         }
@@ -182,6 +183,12 @@ pub fn stereo_node_pairs(g: &Graph, out_node: u32, in_node: u32) -> Vec<(u32, u3
     if out_node == in_node {
         return Vec::new();
     }
+    let (Some(no), Some(ni)) = (g.nodes.get(&out_node), g.nodes.get(&in_node)) else {
+        return Vec::new();
+    };
+    if !no.can_link_to(ni) {
+        return Vec::new();
+    }
     let outs = g.ports_of(out_node, Direction::Out);
     let ins = g.ports_of(in_node, Direction::In);
     if outs.is_empty() || ins.is_empty() {
@@ -223,35 +230,69 @@ pub fn stereo_node_pairs(g: &Graph, out_node: u32, in_node: u32) -> Vec<(u32, u3
     pairs
 }
 
-/// Returns external links that should be severed to prevent audio bleed according to `mode`.
+/// Bleed decision taken once when a node appears (kept for 5 minutes across brief
+/// disappearances, see [`bleed_decision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BleedInfo {
+    /// The node had saved links in the active setup when it (first) appeared.
+    pub managed_at_launch: bool,
+    /// The node appeared after RedoxRouter's startup (a "new app").
+    pub new_app: bool,
+}
+
+/// Decide the bleed state of a node that just appeared.
 ///
-/// - `ManagedNodes`: severs external links if:
-///   - `out_node` has saved outgoing links in the active setup, OR
-///   - `in_node` is a capture stream (`is_stream()`) that has saved incoming links in the active setup,
-///   and this link is not one of the saved links. (Shared destination sinks like Headphones are not
-///   treated as exclusive inputs, so unmanaged apps can still play to them.)
-/// - `AllNodes`: severs external links if either end is an application audio stream (`is_stream`),
-///   and this link is not one of the saved links.
+/// - `previous`: the decision of the last node with the same key and how long ago
+///   it disappeared. If it came back within `keep_for`, its `new_app` status (whether
+///   it was already running at RedoxRouter startup vs launched later) is preserved.
+/// - `in_saved_links`: whether the active setup currently references the node.
+/// - `during_startup`: the node was already running when RedoxRouter started.
+pub fn bleed_decision(
+    previous: Option<(BleedInfo, std::time::Duration)>,
+    keep_for: std::time::Duration,
+    in_saved_links: bool,
+    during_startup: bool,
+) -> BleedInfo {
+    let new_app = match previous {
+        Some((info, gone_for)) if gone_for < keep_for => info.new_app,
+        _ => !during_startup,
+    };
+    BleedInfo {
+        managed_at_launch: in_saved_links,
+        new_app,
+    }
+}
+
+/// Whether the active setup references a node (by name or composite key).
+pub fn node_in_saved_links(saved_links: &[SavedLink], name: &str, key: &str) -> bool {
+    saved_links.iter().any(|l| {
+        (l.enabled || l.has_switch)
+            && (l.out_node == name || l.out_node == key || l.in_node == name || l.in_node == key)
+    })
+}
+
+/// Which of the `candidates` (ids of external links that were just created by
+/// someone else, e.g. WirePlumber's auto-connect right after an app appeared)
+/// should be severed to prevent audio bleed. Links that already existed are never
+/// passed in, so switching modes or adding a Redox link never removes them.
+///
+/// - `ManagedNodes`: sever if the app end (`out_node`, or `in_node` when it is a
+///   capture stream) was managed when it appeared AND is still in the saved links.
+/// - `AllNodes`: the above, plus any link whose app stream end is a new app
+///   (appeared after RedoxRouter started).
+///
+/// Links matching a saved link are kept. Returns `(link_id, out_port, in_port)`.
 pub fn bleed_links_to_sever(
     g: &Graph,
     saved_links: &[SavedLink],
     mode: crate::storage::AutoConnectPrevention,
-    severed_already: &HashSet<u32>,
+    candidates: &[u32],
+    info: &std::collections::HashMap<u32, BleedInfo>,
 ) -> Vec<(u32, u32, u32)> {
-    if mode == crate::storage::AutoConnectPrevention::Off {
+    use crate::storage::AutoConnectPrevention as M;
+    if mode == M::Off {
         return Vec::new();
     }
-    let managed_out: HashSet<&str> = saved_links
-        .iter()
-        .filter(|l| l.enabled || l.has_switch)
-        .map(|l| l.out_node.as_str())
-        .collect();
-    let managed_in: HashSet<&str> = saved_links
-        .iter()
-        .filter(|l| l.enabled || l.has_switch)
-        .map(|l| l.in_node.as_str())
-        .collect();
-
     let expected_pairs: HashSet<(u32, u32)> = saved_links
         .iter()
         .filter(|l| l.enabled)
@@ -259,38 +300,32 @@ pub fn bleed_links_to_sever(
         .collect();
 
     let mut out = Vec::new();
-    for link in g.links.values() {
-        if g.is_owned(link) {
+    for id in candidates {
+        let Some(link) = g.links.get(id) else { continue };
+        if g.is_owned(link) || expected_pairs.contains(&(link.out_port, link.in_port)) {
             continue;
         }
-        let pair = (link.out_port, link.in_port);
-        if expected_pairs.contains(&pair) {
-            continue;
+        // (node, counts as the app end of this link)
+        let ends = [
+            (g.nodes.get(&link.out_node), true),
+            (g.nodes.get(&link.in_node), false),
+        ];
+        let mut sever = false;
+        for (node, is_out) in ends {
+            let Some(n) = node else { continue };
+            let i = info.get(&n.id).copied().unwrap_or_default();
+            let app_end = is_out || n.is_stream();
+            let managed = app_end
+                && i.managed_at_launch
+                && node_in_saved_links(saved_links, &n.name, &n.key());
+            let new_app = n.is_stream() && i.new_app;
+            sever |= match mode {
+                M::Off => false,
+                M::ManagedNodes => managed,
+                M::AllNodes => managed || new_app,
+            };
         }
-        let out_node = g.nodes.get(&link.out_node);
-        let in_node = g.nodes.get(&link.in_node);
-
-        let should_sever = match mode {
-            crate::storage::AutoConnectPrevention::Off => false,
-            crate::storage::AutoConnectPrevention::ManagedNodes => {
-                let out_managed = out_node.map_or(false, |n| {
-                    managed_out.contains(n.name.as_str()) || managed_out.contains(n.key().as_str())
-                });
-                let in_managed = in_node.map_or(false, |n| {
-                    n.is_stream()
-                        && (managed_in.contains(n.name.as_str())
-                            || managed_in.contains(n.key().as_str()))
-                });
-                out_managed || in_managed
-            }
-            crate::storage::AutoConnectPrevention::AllNodes => {
-                let out_is_stream = out_node.map_or(false, |n| n.is_stream());
-                let in_is_stream = in_node.map_or(false, |n| n.is_stream());
-                out_is_stream || in_is_stream
-            }
-        };
-
-        if should_sever && !severed_already.contains(&link.id) {
+        if sever {
             out.push((link.id, link.out_port, link.in_port));
         }
     }
@@ -484,31 +519,80 @@ mod tests {
             },
         ];
 
-        let empty_severed = HashSet::new();
+        use std::collections::HashMap;
+        let all = [101u32, 102];
+        // Both apps were running at startup; only waterfox was managed then.
+        let mut info: HashMap<u32, BleedInfo> = HashMap::new();
+        info.insert(1, BleedInfo { managed_at_launch: true, new_app: false });
+        info.insert(2, BleedInfo { managed_at_launch: false, new_app: false });
 
         // 1. Off mode: nothing severed
-        let to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::Off, &empty_severed);
-        assert!(to_sever.is_empty());
+        assert!(bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::Off, &all, &info).is_empty());
 
-        // 2. ManagedNodes: only Waterfox's link to Speakers is severed, Game's link is kept!
-        let to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::ManagedNodes, &empty_severed);
+        // 2. ManagedNodes: only Waterfox's link to Speakers is severed, Game's link is kept
+        let to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::ManagedNodes, &all, &info);
         assert_eq!(to_sever, vec![(101, 10, 30)]);
 
-        // 3. AllNodes: both Waterfox and Game are severed from Speakers!
-        let mut to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::AllNodes, &empty_severed);
+        // 3. AllNodes: Game was already running at startup, so it is NOT a new app -> kept
+        let to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::AllNodes, &all, &info);
+        assert_eq!(to_sever, vec![(101, 10, 30)]);
+
+        // 4. AllNodes: Game launched after startup -> its auto-link is severed too
+        info.insert(2, BleedInfo { managed_at_launch: false, new_app: true });
+        let mut to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::AllNodes, &all, &info);
         to_sever.sort_by_key(|(id, _, _)| *id);
         assert_eq!(to_sever, vec![(101, 10, 30), (102, 20, 30)]);
+        info.insert(2, BleedInfo { managed_at_launch: false, new_app: false });
 
-        // 4. Expected link: if an external link matches the saved link, it is not severed
+        // 5. Links that are not candidates (already existed) are never touched,
+        //    e.g. when the user switches modes later
+        assert!(bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::AllNodes, &[], &info).is_empty());
+
+        // 6. An external link matching a saved link is kept
         g.apply(Event::LinkAdded(LinkInfo { id: 103, out_node: 1, out_port: 10, in_node: 4, in_port: 40 }));
-        let to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::ManagedNodes, &empty_severed);
-        assert_eq!(to_sever, vec![(101, 10, 30)]); // 103 is preserved
+        assert!(bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::ManagedNodes, &[103], &info).is_empty());
 
-        // 5. Already severed: does not return again
-        let mut severed = HashSet::new();
-        severed.insert(101);
-        let to_sever = bleed_links_to_sever(&g, &saved_links, AutoConnectPrevention::ManagedNodes, &severed);
-        assert!(to_sever.is_empty());
+        // 7. Game (unmanaged at launch) gets a Redox link later: its default link is kept
+        let mut updated_saved = saved_links.clone();
+        updated_saved.push(SavedLink {
+            out_node: "game".into(),
+            out_port: "output_FL".into(),
+            in_node: "Music_Sink".into(),
+            in_port: "playback_FL".into(),
+            enabled: true,
+            waypoints: Vec::new(),
+            lingering: false,
+            has_switch: false,
+            switch_pos: None,
+        });
+        let to_sever = bleed_links_to_sever(&g, &updated_saved, AutoConnectPrevention::ManagedNodes, &all, &info);
+        assert_eq!(to_sever, vec![(101, 10, 30)]);
+
+        // 8. Waterfox was managed at launch but all its saved links were removed -> not managed
+        let only_sink = vec![saved_links[1].clone()];
+        assert!(bleed_links_to_sever(&g, &only_sink, AutoConnectPrevention::ManagedNodes, &all, &info).is_empty());
+    }
+
+    #[test]
+    fn bleed_decision_keeps_state_for_five_minutes() {
+        use std::time::Duration;
+        let keep = Duration::from_secs(300);
+        // Fresh node after startup, in saved links
+        let d = bleed_decision(None, keep, true, false);
+        assert_eq!(d, BleedInfo { managed_at_launch: true, new_app: true });
+        // Already running at startup, not in saved links
+        let d = bleed_decision(None, keep, false, true);
+        assert_eq!(d, BleedInfo { managed_at_launch: false, new_app: false });
+        // Came back after 1 minute after user added a saved link: managed_at_launch is now true,
+        // while its pre-existing startup status (new_app = false) is preserved for 5 minutes.
+        let prev = BleedInfo { managed_at_launch: false, new_app: false };
+        assert_eq!(
+            bleed_decision(Some((prev, Duration::from_secs(60))), keep, true, false),
+            BleedInfo { managed_at_launch: true, new_app: false }
+        );
+        // Came back after 6 minutes: decided again from scratch (new_app becomes true)
+        let d = bleed_decision(Some((prev, Duration::from_secs(360))), keep, true, false);
+        assert_eq!(d, BleedInfo { managed_at_launch: true, new_app: true });
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use crate::links::SavedLink;
 use crate::setups::SetupList;
 use crate::rules::{GroupEntry, Rule, RuleGroup};
+use crate::theme::Theme;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -246,6 +247,11 @@ pub fn save_sinks(sinks: &[SavedSink]) -> Result<(), String> {
     save_json("sinks.json", &sinks)
 }
 
+/// Base configuration directory (`~/.config/RedoxRouter` on Linux).
+pub fn config_dir_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "ZeroKun265", "RedoxRouter").map(|d| d.config_dir().to_path_buf())
+}
+
 /// Directory for exported setup `.json` files (`~/.config/RedoxRouter/exports`).
 pub fn exports_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "ZeroKun265", "RedoxRouter").map(|d| d.config_dir().join("exports"))
@@ -386,6 +392,91 @@ pub fn import_setup_from_path(
     parse_imported_setup(&text, fallback, library)
 }
 
+pub fn theme_path() -> Option<PathBuf> {
+    path("theme.json")
+}
+
+pub fn themes_dir() -> Option<PathBuf> {
+    ProjectDirs::from("", "ZeroKun265", "RedoxRouter").map(|d| d.config_dir().join("themes"))
+}
+
+/// Load the active theme from ~/.config/RedoxRouter/theme.json,
+/// falling back to the default dark theme.
+pub fn load_theme() -> Theme {
+    theme_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Save the active theme to ~/.config/RedoxRouter/theme.json.
+pub fn save_theme(theme: &Theme) -> Result<(), String> {
+    save_json("theme.json", theme)
+}
+
+/// List all saved theme `.json` files in the ~/.config/RedoxRouter/themes/ directory.
+pub fn list_theme_files() -> Vec<PathBuf> {
+    let Some(dir) = themes_dir() else { return Vec::new(); };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new(); };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    files
+}
+
+pub fn export_theme_json(theme: &Theme) -> Result<String, String> {
+    serde_json::to_string_pretty(theme).map_err(|e| e.to_string())
+}
+
+pub fn export_theme_to_path(path: &std::path::Path, theme: &Theme) -> Result<(), String> {
+    let json = export_theme_json(theme)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+pub fn parse_imported_theme(json: &str) -> Result<Theme, String> {
+    serde_json::from_str(json).map_err(|e| format!("invalid theme JSON: {e}"))
+}
+
+pub fn import_theme_from_path(path: &std::path::Path) -> Result<Theme, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    parse_imported_theme(&text)
+}
+
+/// Save a theme with a human name to ~/.config/RedoxRouter/themes/<name>.json.
+pub fn save_named_theme(name: &str, theme: &Theme) -> Result<PathBuf, String> {
+    let Some(dir) = themes_dir() else {
+        return Err("cannot locate themes directory".to_string());
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stem = sanitize_filename(name);
+    let path = dir.join(format!("{stem}.json"));
+    export_theme_to_path(&path, theme)?;
+    Ok(path)
+}
+
+/// Delete a theme file from disk.
+pub fn delete_theme_file(path: &std::path::Path) -> Result<(), String> {
+    std::fs::remove_file(path).map_err(|e| e.to_string())
+}
+
+/// List all saved themes in the themes folder, parsing each.
+pub fn list_saved_themes() -> Vec<(PathBuf, Result<Theme, String>)> {
+    list_theme_files()
+        .into_iter()
+        .map(|p| {
+            let res = import_theme_from_path(&p);
+            (p, res)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +526,44 @@ mod tests {
         let old_json = r#"{"name":"Virtual_Sink_1","description":"Virtual Sink"}"#;
         let parsed: SavedSink = serde_json::from_str(old_json).unwrap();
         assert_eq!(parsed.kind, VirtualDeviceKind::Sink);
+    }
+
+    #[test]
+    fn theme_export_and_import_round_trip() {
+        let mut custom = Theme::light();
+        custom.name = "My Light Theme".to_string();
+        custom.accent = [10, 200, 220];
+        let json = export_theme_json(&custom).unwrap();
+        let imported = parse_imported_theme(&json).unwrap();
+        assert_eq!(imported, custom);
+        assert_eq!(imported.name, "My Light Theme");
+        assert_eq!(imported.accent, [10, 200, 220]);
+    }
+
+    #[test]
+    fn theme_paths_resolve() {
+        assert!(theme_path().is_some());
+        assert!(themes_dir().is_some());
+    }
+
+    #[test]
+    fn sanitize_theme_filename() {
+        assert_eq!(sanitize_filename("My Super Theme!"), "My Super Theme_");
+        assert_eq!(sanitize_filename("   "), "setup");
+        assert_eq!(sanitize_filename("dark-v2_pro"), "dark-v2_pro");
+    }
+
+    #[test]
+    fn theme_save_and_delete_to_path() {
+        let dir = std::env::temp_dir().join(format!("redox_theme_test_{}", std::process::id()));
+        let path = dir.join("test_theme.json");
+        let theme = Theme::dark();
+        assert!(export_theme_to_path(&path, &theme).is_ok());
+        assert!(path.exists());
+        let loaded = import_theme_from_path(&path).unwrap();
+        assert_eq!(loaded.name, theme.name);
+        assert!(delete_theme_file(&path).is_ok());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir(&dir);
     }
 }

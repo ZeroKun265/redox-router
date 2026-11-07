@@ -172,8 +172,15 @@ fn run(
         .error(move |id, _seq, res, message| {
             rlog!("core error id={id} res={res}: {message}");
             // -ENOENT (-2) happens benignly when an object disappears right as we bind or destroy it.
-            if res != -2 {
-                let _ = tx_err.send(Event::Error(format!("pipewire error {id}/{res}: {message}")));
+            // -EEXIST (-17) on link-factory happens benignly when WirePlumber creates the exact same
+            // link between two ports in a sub-millisecond race with our auto-connect.
+            if res != -2 && res != -17 {
+                let friendly_msg = if res == -22 && message.contains("Format negotiation") {
+                    "Link format negotiation failed: incompatible port formats or media types".to_string()
+                } else {
+                    format!("pipewire error {id}/{res}: {message}")
+                };
+                let _ = tx_err.send(Event::Error(friendly_msg));
                 ctx_err.request_repaint();
             }
             // Quit the loop only if the connection is dead (EPIPE = -32, ECONNRESET = -104).
@@ -233,6 +240,9 @@ fn run(
                     let owned_links_weak = Rc::downgrade(&owned_links_cmd);
                     let key_clone = key;
 
+                    let tx_rm_link = tx_cmd.clone();
+                    let ctx_rm_link = ctx_cmd.clone();
+
                     let listener = link
                         .upcast_ref()
                         .add_listener_local()
@@ -245,6 +255,11 @@ fn run(
                             if let Some(links) = owned_links_weak.upgrade() {
                                 links.borrow_mut().remove(&key_clone);
                             }
+                            let _ = tx_rm_link.send(Event::OwnedRemoved {
+                                out_port: key_clone.0,
+                                in_port: key_clone.1,
+                            });
+                            ctx_rm_link.request_repaint();
                         })
                         .register();
 
@@ -433,18 +448,27 @@ fn run(
                 ctx_add.request_repaint();
             }
 
-            // Audio nodes: watch their Props for volume and mute changes.
-            let is_audio = obj.type_ == ObjectType::Node
-                && get("media.class").is_some_and(|c| c.contains("Audio"));
-            if is_audio {
+            // Watch all nodes (audio and video): track active state (Running vs Idle/Suspended)
+            // and Props (for volume/mute on audio nodes).
+            if obj.type_ == ObjectType::Node {
+                let is_audio = get("media.class").is_some_and(|c| c.contains("Audio"));
                 if let Some(reg) = registry_weak.upgrade() {
                     let bound: Result<Node, _> = reg.bind(obj);
                     match bound {
                         Ok(node) => {
                             let id = obj.id;
                             let (tx_p, ctx_p) = (tx_add.clone(), ctx_add.clone());
+                            let (tx_i, ctx_i) = (tx_add.clone(), ctx_add.clone());
                             let listener = node
                                 .add_listener_local()
+                                .info(move |info| {
+                                    let is_running = matches!(info.state(), pw::node::NodeState::Running);
+                                    let _ = tx_i.send(Event::NodeStateChanged {
+                                        node_id: id,
+                                        is_running,
+                                    });
+                                    ctx_i.request_repaint();
+                                })
                                 .param(move |_seq, _id, _index, _next, param| {
                                     if let Some(ev) = param.and_then(|p| parse_props(id, p)) {
                                         let _ = tx_p.send(ev);
@@ -452,7 +476,9 @@ fn run(
                                     }
                                 })
                                 .register();
-                            node.subscribe_params(&[ParamType::Props]);
+                            if is_audio {
+                                node.subscribe_params(&[ParamType::Props]);
+                            }
                             nodes_add.borrow_mut().insert(id, node);
                             listeners_add.borrow_mut().insert(id, Box::new(listener));
                         }

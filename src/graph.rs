@@ -68,6 +68,11 @@ pub enum Event {
         channels: Option<Vec<f32>>,
         mute: Option<bool>,
     },
+    /// Node execution state changed (e.g. Running vs Idle/Suspended).
+    NodeStateChanged {
+        node_id: u32,
+        is_running: bool,
+    },
     Error(String),
 }
 
@@ -141,6 +146,28 @@ impl NodeInfo {
             self.name.clone()
         } else {
             format!("{}|{}", self.name, self.media_class)
+        }
+    }
+
+    /// High-level media category (Audio, Video, Midi) based on media.class.
+    pub fn media_type(&self) -> Option<&'static str> {
+        let mc = self.media_class.to_lowercase();
+        if mc.contains("audio") {
+            Some("audio")
+        } else if mc.contains("video") {
+            Some("video")
+        } else if mc.contains("midi") {
+            Some("midi")
+        } else {
+            None
+        }
+    }
+
+    /// Whether this node can be linked to `other` based on media type compatibility.
+    pub fn can_link_to(&self, other: &NodeInfo) -> bool {
+        match (self.media_type(), other.media_type()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
         }
     }
 }
@@ -227,6 +254,8 @@ pub struct Graph {
     /// (device id, route device number). Read-only: devices are controlled by
     /// the system volume control, not by RedoxRouter.
     pub routes: BTreeMap<(u32, u32), NodeVolume>,
+    /// Nodes currently in `Running` state (streaming audio or video buffers).
+    pub running_nodes: HashSet<u32>,
     pub error: Option<String>,
 }
 
@@ -253,6 +282,7 @@ impl Graph {
                 self.owned_node_ids.remove(&id);
                 self.volumes.remove(&id);
                 self.routes.retain(|k, _| k.0 != id); // a device object went away
+                self.running_nodes.remove(&id);
                 self.ports.remove(&id);
                 if let Some(l) = self.links.remove(&id) {
                     if self.owned_ids.remove(&id) {
@@ -269,6 +299,16 @@ impl Graph {
             Event::OwnedAdded { out_port, in_port } => {
                 self.owned_pairs.insert((out_port, in_port));
             }
+            Event::OwnedRemoved { out_port, in_port } => {
+                self.owned_pairs.remove(&(out_port, in_port));
+            }
+            Event::NodeStateChanged { node_id, is_running } => {
+                if is_running {
+                    self.running_nodes.insert(node_id);
+                } else {
+                    self.running_nodes.remove(&node_id);
+                }
+            }
             Event::Volume { node_id, master, channels, mute } => {
                 let v = self.volumes.entry(node_id).or_insert_with(NodeVolume::new);
                 v.merge(master, channels, mute);
@@ -279,9 +319,6 @@ impl Graph {
                     .entry((device_id, route_device))
                     .or_insert_with(NodeVolume::new);
                 v.merge(master, channels, mute);
-            }
-            Event::OwnedRemoved { out_port, in_port } => {
-                self.owned_pairs.remove(&(out_port, in_port));
             }
             Event::Error(e) => self.error = Some(e),
         }
@@ -302,6 +339,22 @@ impl Graph {
         self.owned_ids.contains(&l.id)
     }
 
+    /// True if the node is actively streaming audio or video buffers right now
+    /// (`NodeState::Running` in PipeWire) and, for audio nodes, is unmuted with non-zero volume.
+    pub fn is_node_active(&self, node_id: u32) -> bool {
+        if !self.running_nodes.contains(&node_id) {
+            return false;
+        }
+        if let Some(node) = self.nodes.get(&node_id) {
+            if let Some(vol) = self.volume_of(node) {
+                if vol.mute || vol.effective() <= 0.001 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     pub fn is_node_owned(&self, node: &NodeInfo) -> bool {
         node.is_owned || self.owned_node_ids.contains(&node.id)
     }
@@ -319,6 +372,23 @@ impl Graph {
             }
         }
         found
+    }
+
+    /// Whether an output port and input port are format/media-type compatible.
+    pub fn can_link_ports(&self, out_port: u32, in_port: u32) -> bool {
+        let (Some(po), Some(pi)) = (self.ports.get(&out_port), self.ports.get(&in_port)) else {
+            return false;
+        };
+        if po.direction != Direction::Out || pi.direction != Direction::In {
+            return false;
+        }
+        if po.node_id == pi.node_id {
+            return false;
+        }
+        let (Some(no), Some(ni)) = (self.nodes.get(&po.node_id), self.nodes.get(&pi.node_id)) else {
+            return true;
+        };
+        no.can_link_to(ni)
     }
 
     /// Ports of a node with the given direction, ordered by port id.
@@ -543,5 +613,101 @@ mod tests {
             is_owned: false,
         };
         assert_eq!(legacy_no_class.key(), "simple");
+    }
+
+    #[test]
+    fn node_activity_checks_running_and_volume() {
+        let mut g = Graph::default();
+        let node = NodeInfo {
+            id: 10,
+            name: "firefox".into(),
+            description: "Firefox Audio".into(),
+            media_class: "Stream/Output/Audio".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        g.apply(Event::NodeAdded(node));
+        assert!(!g.is_node_active(10));
+
+        // When node transitions to running:
+        g.apply(Event::NodeStateChanged { node_id: 10, is_running: true });
+        assert!(g.is_node_active(10));
+
+        // When node is muted, active becomes false:
+        g.apply(Event::Volume { node_id: 10, master: None, channels: None, mute: Some(true) });
+        assert!(!g.is_node_active(10));
+
+        // When unmuted:
+        g.apply(Event::Volume { node_id: 10, master: None, channels: None, mute: Some(false) });
+        assert!(g.is_node_active(10));
+
+        // When node stops running (Idle/Suspended):
+        g.apply(Event::NodeStateChanged { node_id: 10, is_running: false });
+        assert!(!g.is_node_active(10));
+
+        // Video node without volume:
+        let video_node = NodeInfo {
+            id: 20,
+            name: "webcam".into(),
+            description: "USB Camera".into(),
+            media_class: "Video/Source".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        g.apply(Event::NodeAdded(video_node));
+        assert!(!g.is_node_active(20));
+        g.apply(Event::NodeStateChanged { node_id: 20, is_running: true });
+        assert!(g.is_node_active(20));
+        g.apply(Event::Removed(20));
+        assert!(!g.is_node_active(20));
+    }
+
+    #[test]
+    fn media_compatibility_and_port_linking() {
+        let mut g = Graph::default();
+        let audio_out_node = NodeInfo {
+            id: 1,
+            name: "waterfox".into(),
+            description: "Browser".into(),
+            media_class: "Stream/Output/Audio".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        let midi_in_node = NodeInfo {
+            id: 2,
+            name: "midi_synth".into(),
+            description: "Synth".into(),
+            media_class: "Midi/Bridge".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        let audio_in_node = NodeInfo {
+            id: 3,
+            name: "speakers".into(),
+            description: "Headphones".into(),
+            media_class: "Audio/Sink".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: false,
+        };
+        g.apply(Event::NodeAdded(audio_out_node));
+        g.apply(Event::NodeAdded(midi_in_node));
+        g.apply(Event::NodeAdded(audio_in_node));
+
+        g.apply(Event::PortAdded(PortInfo { id: 10, node_id: 1, name: "output_FL".into(), direction: Direction::Out }));
+        g.apply(Event::PortAdded(PortInfo { id: 20, node_id: 2, name: "input_0".into(), direction: Direction::In }));
+        g.apply(Event::PortAdded(PortInfo { id: 30, node_id: 3, name: "playback_FL".into(), direction: Direction::In }));
+
+        // Waterfox (audio) to Midi is rejected:
+        assert!(!g.can_link_ports(10, 20));
+        // Waterfox (audio) to Speakers (audio) is accepted:
+        assert!(g.can_link_ports(10, 30));
+        // Same direction or same node rejected:
+        assert!(!g.can_link_ports(10, 10));
+        assert!(!g.can_link_ports(30, 20));
     }
 }

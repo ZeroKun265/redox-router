@@ -11,11 +11,126 @@ use crate::volume;
 use std::collections::BTreeMap;
 use crate::rules::{self, GroupEntry, RuleGroup, RuleSet};
 use crate::storage::{LayoutFile, Note, NoteKind};
+use crate::theme::{GridPattern, SwitchGradMode, Theme};
 use eframe::egui::{
     self, pos2, vec2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Shape, Stroke,
     Vec2,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+fn lerp_color32(c1: Color32, c2: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0_f32, 1.0_f32);
+    let r = (c1.r() as f32 * (1.0 - t) + c2.r() as f32 * t).round() as u8;
+    let g = (c1.g() as f32 * (1.0 - t) + c2.g() as f32 * t).round() as u8;
+    let b = (c1.b() as f32 * (1.0 - t) + c2.b() as f32 * t).round() as u8;
+    let a = (c1.a() as f32 * (1.0 - t) + c2.a() as f32 * t).round() as u8;
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn build_polyline_ribbon(
+    pts: &[Pos2],
+    width: f32,
+    c_start: Color32,
+    c_end: Color32,
+    alpha_override: Option<u8>,
+) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    if pts.len() < 2 {
+        return mesh;
+    }
+    let mut clean_pts: Vec<Pos2> = Vec::with_capacity(pts.len());
+    for &p in pts {
+        if let Some(&last) = clean_pts.last() {
+            if (p - last).length_sq() < 1e-4 {
+                continue;
+            }
+        }
+        clean_pts.push(p);
+    }
+    let n = clean_pts.len();
+    if n < 2 {
+        return mesh;
+    }
+    let half_w = width * 0.5;
+
+    let mut dirs: Vec<Vec2> = Vec::with_capacity(n - 1);
+    for w in clean_pts.windows(2) {
+        let delta = w[1] - w[0];
+        let len = delta.length();
+        dirs.push(if len > 1e-4 { delta / len } else { vec2(1.0, 0.0) });
+    }
+
+    for i in 0..n {
+        let t = i as f32 / (n - 1) as f32;
+        let mut color = lerp_color32(c_start, c_end, t);
+        if let Some(a) = alpha_override {
+            color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a);
+        }
+
+        let normal = if i == 0 {
+            vec2(-dirs[0].y, dirs[0].x)
+        } else if i == n - 1 {
+            vec2(-dirs[n - 2].y, dirs[n - 2].x)
+        } else {
+            let d1 = dirs[i - 1];
+            let d2 = dirs[i];
+            let avg = d1 + d2;
+            let avg_len = avg.length();
+            if avg_len > 1e-4 {
+                let norm = vec2(-avg.y / avg_len, avg.x / avg_len);
+                let n1 = vec2(-d1.y, d1.x);
+                let cos_half = (norm.x * n1.x + norm.y * n1.y).abs();
+                let miter = (1.0 / cos_half.max(0.5)).min(1.8);
+                norm * miter
+            } else {
+                vec2(-d1.y, d1.x)
+            }
+        };
+
+        let offset = normal * half_w;
+        let p = clean_pts[i];
+        mesh.colored_vertex(p + offset, color);
+        mesh.colored_vertex(p - offset, color);
+    }
+
+    for i in 0..(n - 1) {
+        let base = (i * 2) as u32;
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base + 1, base + 3, base + 2);
+    }
+
+    mesh
+}
+
+fn draw_cable_path(
+    painter: &egui::Painter,
+    pts: &[Pos2],
+    w_stroke: f32,
+    solid_col: Color32,
+    gradient: Option<(Color32, Color32)>,
+    glow: bool,
+) {
+    if pts.len() < 2 {
+        return;
+    }
+    match gradient {
+        Some((c_start, c_end)) => {
+            if glow {
+                let glow_mesh = build_polyline_ribbon(pts, w_stroke * 3.2, c_start, c_end, Some(30));
+                painter.add(Shape::mesh(glow_mesh));
+            }
+            let cable_mesh = build_polyline_ribbon(pts, w_stroke, c_start, c_end, None);
+            painter.add(Shape::mesh(cable_mesh));
+        }
+        None => {
+            if glow {
+                let glow_c = Color32::from_rgba_unmultiplied(solid_col.r(), solid_col.g(), solid_col.b(), 30);
+                painter.add(Shape::line(pts.to_vec(), Stroke::new(w_stroke * 3.2, glow_c)));
+            }
+            painter.add(Shape::line(pts.to_vec(), Stroke::new(w_stroke, solid_col)));
+        }
+    }
+}
 
 /// Changes asked through a comment's / block's menu, applied after drawing.
 enum NoteOp {
@@ -151,6 +266,8 @@ pub struct Canvas {
     pub auto_connect_prevention: crate::storage::AutoConnectPrevention,
     /// External links the user chose to show individually ("visible only").
     pub revealed: HashSet<(u32, u32)>,
+    /// Active visual theme.
+    pub theme: Theme,
 }
 
 impl Default for Canvas {
@@ -199,6 +316,7 @@ impl Default for Canvas {
             ctx_link: None,
             auto_connect_prevention: crate::storage::AutoConnectPrevention::Off,
             revealed: HashSet::new(),
+            theme: Theme::default(),
         }
     }
 }
@@ -231,8 +349,12 @@ const SWATCHES: [[u8; 3]; 8] = [
 ];
 
 /// Points spaced `spacing` apart along a polyline, shifted forward by `phase`
-/// (used for the dots that flow along links).
-fn dots_along(pts: &[Pos2], spacing: f32, phase: f32) -> Vec<Pos2> {
+/// (used for the dots that flow along links), along with normalized progress `0.0..=1.0`.
+fn dots_along(pts: &[Pos2], spacing: f32, phase: f32) -> Vec<(Pos2, f32)> {
+    let total: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut next = phase.rem_euclid(spacing);
     let mut walked = 0.0;
@@ -242,12 +364,37 @@ fn dots_along(pts: &[Pos2], spacing: f32, phase: f32) -> Vec<Pos2> {
             continue;
         }
         while next <= walked + seg {
-            out.push(w[0] + (w[1] - w[0]) * ((next - walked) / seg));
+            let p = w[0] + (w[1] - w[0]) * ((next - walked) / seg);
+            out.push((p, (next / total).clamp(0.0, 1.0)));
             next += spacing;
         }
         walked += seg;
     }
     out
+}
+
+fn draw_flowing_dots(
+    painter: &egui::Painter,
+    pts: &[Pos2],
+    w_stroke: f32,
+    solid_col: Color32,
+    gradient: Option<(Color32, Color32)>,
+    time: f32,
+) {
+    let r_dot = (w_stroke * 0.75).clamp(1.5, 3.0);
+    for (p, t) in dots_along(pts, 26.0, time * 38.0) {
+        let base = match gradient {
+            Some((c1, c2)) => lerp_color32(c1, c2, t),
+            None => solid_col,
+        };
+        let dot_col = Color32::from_rgba_unmultiplied(
+            base.r().saturating_add(68),
+            base.g().saturating_add(68),
+            base.b().saturating_add(68),
+            232,
+        );
+        painter.circle_filled(p, r_dot, dot_col);
+    }
 }
 
 /// Screen-space path of a cable from output `a` through `wps` to input `b`.
@@ -272,7 +419,7 @@ fn link_path(
         pts.extend(p);
     }
     if style == layout::LinkStyle::Zigzag {
-        pts = layout::round_corners(&pts, 12.0 * z, 6);
+        pts = layout::round_corners(&pts, 12.0 * z, 10);
     }
     pts.into_iter().map(|(x, y)| pos2(x, y)).collect()
 }
@@ -359,7 +506,11 @@ fn comment_rect_and_galley(
 /// One piece of a cable between two points (corner points for zigzag).
 fn piece(style: layout::LinkStyle, a: Pos2, b: Pos2, z: f32, lane_id: u32) -> Vec<(f32, f32)> {
     match style {
-        layout::LinkStyle::Curved => layout::bezier_points((a.x, a.y), (b.x, b.y), 24, 40.0 * z),
+        layout::LinkStyle::Curved => {
+            let dist = (b - a).length();
+            let segs = ((dist / 7.0_f32).round() as usize).clamp(36, 128);
+            layout::bezier_points((a.x, a.y), (b.x, b.y), segs, 40.0 * z)
+        }
         layout::LinkStyle::Zigzag => {
             let lane = ((lane_id % 7) as f32 - 3.0) * 5.0 * z;
             layout::zigzag_points((a.x, a.y), (b.x, b.y), 22.0 * z, lane)
@@ -530,6 +681,22 @@ impl Canvas {
         }
     }
 
+    pub fn zoom_in(&mut self) {
+        self.zoom = (self.zoom * 1.2).clamp(layout::MIN_ZOOM, layout::MAX_ZOOM);
+        self.dirty = true;
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.zoom = (self.zoom / 1.2).clamp(layout::MIN_ZOOM, layout::MAX_ZOOM);
+        self.dirty = true;
+    }
+
+    pub fn reset_view(&mut self) {
+        self.pan = vec2(20.0, 20.0);
+        self.zoom = 1.0;
+        self.dirty = true;
+    }
+
     /// Center the viewport on `node_id` and select it.
     pub fn focus_node(&mut self, node_id: u32) {
         if let Some(&(x, y)) = self.pos.get(&node_id) {
@@ -612,10 +779,7 @@ impl Canvas {
             }
         }
         for note in &mut self.notes {
-            if note.kind == NoteKind::Text
-                && self.sel_notes.contains(&note.id)
-                && Some(note.id) != skip_note
-            {
+            if self.sel_notes.contains(&note.id) && Some(note.id) != skip_note {
                 note.pos = (note.pos.0 + d.x, note.pos.1 + d.y);
             }
         }
@@ -644,6 +808,14 @@ impl Canvas {
         self.selected
     }
 
+    pub fn pos_of(&self, node_id: u32) -> Option<(f32, f32)> {
+        self.pos.get(&node_id).copied()
+    }
+
+    pub fn size_of(&self, node_id: u32) -> Option<(f32, f32)> {
+        self.node_sizes.get(&node_id).copied()
+    }
+
     /// Forget all node positions (also the saved ones); nodes are re-stacked
     /// on the next frame.
     pub fn reset_layout(&mut self) {
@@ -668,26 +840,52 @@ impl Canvas {
         let snap_active = self.snap_to_grid;
         let grid_unit = layout::GRID_STEP * 0.5;
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(0), Color32::from_rgb(22, 23, 28));
-        {
-            // Dot grid that follows pan and zoom (spacing doubles when too dense).
-            let mut step = 28.0 * self.zoom;
-            while step < 18.0 {
-                step *= 2.0;
+        painter.rect_filled(rect, CornerRadius::same(0), self.theme.c_canvas_bg());
+        match self.theme.grid_pattern {
+            GridPattern::Dots => {
+                let mut step = 28.0 * self.zoom;
+                while step < 18.0 {
+                    step *= 2.0;
+                }
+                let origin = rect.min + self.pan;
+                let x0 = rect.min.x + (origin.x - rect.min.x).rem_euclid(step);
+                let y0 = rect.min.y + (origin.y - rect.min.y).rem_euclid(step);
+                let dot = self.theme.c_grid_dot();
+                let mut y = y0;
+                while y < rect.max.y {
+                    let mut x = x0;
+                    while x < rect.max.x {
+                        painter.circle_filled(pos2(x, y), 1.1, dot);
+                        x += step;
+                    }
+                    y += step;
+                }
             }
-            let origin = rect.min + self.pan;
-            let x0 = rect.min.x + (origin.x - rect.min.x).rem_euclid(step);
-            let y0 = rect.min.y + (origin.y - rect.min.y).rem_euclid(step);
-            let dot = Color32::from_rgb(44, 46, 56);
-            let mut y = y0;
-            while y < rect.max.y {
+            GridPattern::Lines => {
+                let mut step = 28.0 * self.zoom;
+                while step < 18.0 {
+                    step *= 2.0;
+                }
+                let origin = rect.min + self.pan;
+                let x0 = rect.min.x + (origin.x - rect.min.x).rem_euclid(step);
+                let y0 = rect.min.y + (origin.y - rect.min.y).rem_euclid(step);
+                let line_col = self.theme.c32_alpha(
+                    self.theme.grid_dot,
+                    if self.theme.is_dark { 55 } else { 75 },
+                );
+                let stroke = Stroke::new(1.0_f32, line_col);
                 let mut x = x0;
                 while x < rect.max.x {
-                    painter.circle_filled(pos2(x, y), 1.1, dot);
+                    painter.line_segment([pos2(x, rect.min.y), pos2(x, rect.max.y)], stroke);
                     x += step;
                 }
-                y += step;
+                let mut y = y0;
+                while y < rect.max.y {
+                    painter.line_segment([pos2(rect.min.x, y), pos2(rect.max.x, y)], stroke);
+                    y += step;
+                }
             }
+            GridPattern::None => {}
         }
 
         // Pan with middle mouse button only; left-drag on empty canvas starts a box
@@ -756,6 +954,14 @@ impl Canvas {
                 continue;
             }
             let c = n.color;
+            if self.sel_notes.contains(&n.id) {
+                painter.rect_stroke(
+                    r.expand(2.0 * z),
+                    CornerRadius::same(9),
+                    Stroke::new(2.0_f32, self.theme.c_accent()),
+                    egui::StrokeKind::Outside,
+                );
+            }
             painter.rect_filled(r, CornerRadius::same(8), Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 40));
             painter.rect_stroke(
                 r,
@@ -781,12 +987,23 @@ impl Canvas {
             let resp = ui
                 .interact(bar, ui.id().with(("note", n.id)), Sense::click_and_drag())
                 .on_hover_cursor(egui::CursorIcon::Grab)
-                .on_hover_text("Drag: move the block. Double-click: select the nodes and comments inside, then drag to move them too");
+                .on_hover_text("Click: select block (Delete removes it). Drag: move the block. Double-click: select the nodes and comments inside, then drag to move them too");
+            if resp.clicked() && self.select_mode != SelectMode::Links {
+                let add = ui.input(|i| i.modifiers.shift);
+                if !add {
+                    self.sel_nodes.clear();
+                    self.sel_notes.clear();
+                    self.box_links.clear();
+                    self.selected = None;
+                    self.group_sel = None;
+                }
+                self.sel_notes.insert(n.id);
+            }
             if resp.dragged_by(egui::PointerButton::Primary) {
                 let d = resp.drag_delta() / z;
                 self.notes[i].pos = (n.pos.0 + d.x, n.pos.1 + d.y);
-                if self.group_sel == Some(n.id) {
-                    self.move_selected(g, d, None, None);
+                if self.group_sel == Some(n.id) || self.sel_notes.contains(&n.id) {
+                    self.move_selected(g, d, None, Some(n.id));
                 }
             }
             if resp.drag_stopped_by(egui::PointerButton::Primary) {
@@ -815,7 +1032,11 @@ impl Canvas {
             painter.line_segment([r.max + vec2(-6.0, -2.0) * z, r.max + vec2(-2.0, -6.0) * z], gs);
         }
         // Text width at zoom 1, used to size nodes so labels do not overlap.
-        let (title_font, port_font) = (FontId::proportional(13.0), FontId::proportional(11.0));
+        let ndelta = self.theme.node_font_size_delta;
+        let (title_font, port_font) = (
+            FontId::proportional((13.0 + ndelta).max(8.0)),
+            FontId::proportional((11.0 + ndelta).max(7.0)),
+        );
         let text_w = |t: &str, f: &FontId| {
             painter
                 .layout_no_wrap(t.to_string(), f.clone(), Color32::WHITE)
@@ -956,13 +1177,13 @@ impl Canvas {
                             to_hide.push(k.clone());
                             ui.close_menu();
                         }
-                        if node.is_sink() {
-                            if ui.button("Destroy sink").clicked() {
+                        if g.is_node_owned(node) && node.is_sink() {
+                            if ui.button("Destroy virtual sink").clicked() {
                                 action = Some(Action::DestroySink { node_id: node.id });
                                 ui.close_menu();
                             }
-                        } else if node.is_source() {
-                            if ui.button("Destroy mic").clicked() {
+                        } else if g.is_node_owned(node) && node.is_source() {
+                            if ui.button("Destroy virtual mic").clicked() {
                                 action = Some(Action::DestroySink { node_id: node.id });
                                 ui.close_menu();
                             }
@@ -971,7 +1192,7 @@ impl Canvas {
                             let targets: Vec<(u32, String)> = g
                                 .nodes
                                 .values()
-                                .filter(|o| o.id != node.id && !g.ports_of(o.id, Direction::In).is_empty())
+                                .filter(|o| o.id != node.id && node.can_link_to(o) && !g.ports_of(o.id, Direction::In).is_empty())
                                 .map(|o| (o.id, o.label().to_string()))
                                 .collect();
                             if !targets.is_empty() {
@@ -1306,46 +1527,49 @@ impl Canvas {
                 let w_stroke = if picked {
                     (3.0 * z).clamp(2.0, 4.5)
                 } else {
-                    (2.3 * z).clamp(1.3, 3.3)
+                    (self.theme.cable_thickness_switch * z).clamp(1.0, 6.0)
                 };
                 let active_col = if picked {
-                    Color32::from_rgb(255, 206, 84)
+                    self.theme.c_cable_selected()
                 } else {
-                    Color32::from_rgb(186, 120, 255)
+                    self.theme.c_cable_switch()
                 };
+                let (grad_before, grad_after) = if !picked && self.theme.cable_grad_switch_enabled {
+                    match self.theme.cable_grad_switch_mode {
+                        SwitchGradMode::Simple => {
+                            let c0 = self.theme.c_cable_grad_switch_start();
+                            let c1 = self.theme.c_cable_grad_switch_end();
+                            let cmid = lerp_color32(c0, c1, 0.5_f32);
+                            (Some((c0, cmid)), Some((cmid, c1)))
+                        }
+                        SwitchGradMode::Advanced => {
+                            let c_in = self.theme.c_cable_grad_switch_start();
+                            let c_sw_in = self.theme.c_cable_grad_switch_mid_in();
+                            let c_sw_out = self.theme.c_cable_grad_switch_mid_out();
+                            let c_out = self.theme.c_cable_grad_switch_end();
+                            (Some((c_in, c_sw_in)), Some((c_sw_out, c_out)))
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                let glow = self.theme.cable_glow_switch;
+
                 // First half (up to the switch): always colored and animated.
-                let stroke_before = Stroke::new(w_stroke, active_col);
-                let glow_before = Stroke::new(
-                    w_stroke * 3.2,
-                    Color32::from_rgba_unmultiplied(active_col.r(), active_col.g(), active_col.b(), 32),
-                );
-                painter.add(Shape::line(pts_before.clone(), glow_before));
-                painter.add(Shape::line(pts_before.clone(), stroke_before));
-                let dot_col = Color32::from_rgba_unmultiplied(
-                    active_col.r().saturating_add(65),
-                    active_col.g().saturating_add(65),
-                    active_col.b().saturating_add(65),
-                    235,
-                );
-                let r_dot = (w_stroke * 0.75).clamp(1.5, 3.0);
-                for p in dots_along(&pts_before, 26.0, time * 38.0) {
-                    painter.circle_filled(p, r_dot, dot_col);
-                }
+                draw_cable_path(&painter, &pts_before, w_stroke, active_col, grad_before, glow);
+                draw_flowing_dots(&painter, &pts_before, w_stroke, active_col, grad_before, time);
 
                 // Second half (after the switch): colored + animated only when the switch is ON.
                 if switch_on {
-                    painter.add(Shape::line(pts_after.clone(), glow_before));
-                    painter.add(Shape::line(pts_after.clone(), stroke_before));
-                    for p in dots_along(&pts_after, 26.0, time * 38.0) {
-                        painter.circle_filled(p, r_dot, dot_col);
-                    }
+                    draw_cable_path(&painter, &pts_after, w_stroke, active_col, grad_after, glow);
+                    draw_flowing_dots(&painter, &pts_after, w_stroke, active_col, grad_after, time);
                 } else {
                     let off_col = if picked {
                         Color32::from_rgba_unmultiplied(195, 160, 75, 130)
                     } else {
                         Color32::from_rgba_unmultiplied(110, 108, 128, 125)
                     };
-                    let stroke_after = Stroke::new((1.6 * z).clamp(1.0, 2.5), off_col);
+                    let stroke_after = Stroke::new((1.6_f32 * z).clamp(1.0, 2.5), off_col);
                     painter.add(Shape::line(pts_after, stroke_after));
                 }
 
@@ -1353,38 +1577,40 @@ impl Canvas {
                 shapes.push((pair, pts_all));
             } else {
                 let pts = link_path(self.link_style, *a, &wps, *b, z, pair.0);
-                let stroke = if picked {
-                    Stroke::new((3.0 * z).clamp(2.0, 4.5), Color32::from_rgb(255, 206, 84))
+                let w_stroke = if picked {
+                    (3.0 * z).clamp(2.0, 4.5)
                 } else if owned {
-                    Stroke::new((2.2 * z).clamp(1.2, 3.2), Color32::from_rgb(92, 196, 230))
+                    (self.theme.cable_thickness_owned * z).clamp(1.0, 6.0)
                 } else {
-                    Stroke::new(
-                        (1.5 * z).clamp(1.0, 2.5),
-                        Color32::from_rgba_unmultiplied(150, 150, 165, 170),
-                    )
+                    (self.theme.cable_thickness_external * z).clamp(0.8, 5.0)
                 };
-                {
-                    // Soft glow under every link (grey for external ones).
-                    let c = stroke.color;
-                    let glow = Stroke::new(
-                        stroke.width * 3.2,
-                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 30),
-                    );
-                    painter.add(Shape::line(pts.clone(), glow));
-                }
-                painter.add(Shape::line(pts.clone(), stroke));
+                let (solid_col, grad, glow) = if picked {
+                    (self.theme.c_cable_selected(), None, true)
+                } else if owned {
+                    let g = if self.theme.cable_grad_owned_enabled {
+                        Some((
+                            self.theme.c_cable_grad_owned_start(),
+                            self.theme.c_cable_grad_owned_end(),
+                        ))
+                    } else {
+                        None
+                    };
+                    (self.theme.c_cable_owned(), g, self.theme.cable_glow_owned)
+                } else {
+                    let g = if self.theme.cable_grad_external_enabled {
+                        Some((
+                            self.theme.c_cable_grad_external_start(),
+                            self.theme.c_cable_grad_external_end(),
+                        ))
+                    } else {
+                        None
+                    };
+                    (self.theme.c_cable_external(), g, self.theme.cable_glow_external)
+                };
+
+                draw_cable_path(&painter, &pts, w_stroke, solid_col, grad, glow);
                 // Dots flowing from the output port to the input port.
-                let c = stroke.color;
-                let dot = Color32::from_rgba_unmultiplied(
-                    c.r().saturating_add(70),
-                    c.g().saturating_add(70),
-                    c.b().saturating_add(70),
-                    230,
-                );
-                let r_dot = (stroke.width * 0.75).clamp(1.5, 3.0);
-                for p in dots_along(&pts, 26.0, time * 38.0) {
-                    painter.circle_filled(p, r_dot, dot);
-                }
+                draw_flowing_dots(&painter, &pts, w_stroke, solid_col, grad, time);
                 shapes.push((pair, pts));
             }
         }
@@ -1421,7 +1647,7 @@ impl Canvas {
                 p,
                 (5.0 * z).clamp(4.0, 7.0),
                 if hot { Color32::WHITE } else { Color32::from_gray(225) },
-                Stroke::new(2.0_f32, Color32::from_rgb(255, 206, 84)),
+                Stroke::new(2.0_f32, self.theme.c_cable_selected()),
             );
         }
         if let Some((i, k)) = remove_wp {
@@ -1542,24 +1768,27 @@ impl Canvas {
                 }
             });
 
+            let sw_col = self.theme.c_cable_switch();
             let rad = (sw_size.y * 0.5).round() as u8;
             painter.rect_filled(
                 sw_rect.translate(vec2(0.0, 2.0 * zz)).expand(1.5 * zz),
                 CornerRadius::same(rad),
-                Color32::from_black_alpha(90),
+                Color32::from_black_alpha(if self.theme.is_dark { 90 } else { 40 }),
             );
             let bg_fill = if sw_on {
-                Color32::from_rgb(56, 38, 82)
+                lerp_color32(self.theme.c_node_body(), sw_col, 0.35)
             } else {
-                Color32::from_rgb(30, 31, 38)
+                self.theme.c_node_body()
             };
             painter.rect_filled(sw_rect, CornerRadius::same(rad), bg_fill);
             let border_col = if picked || resp.hovered() {
-                Color32::from_rgb(255, 206, 84)
+                self.theme.c_cable_selected()
             } else if sw_on {
-                Color32::from_rgb(186, 120, 255)
-            } else {
+                sw_col
+            } else if self.theme.is_dark {
                 Color32::from_rgb(105, 100, 125)
+            } else {
+                Color32::from_rgb(160, 158, 175)
             };
             painter.rect_stroke(
                 sw_rect,
@@ -1573,7 +1802,9 @@ impl Canvas {
                 sw_rect.min.x + sw_size.y * 0.5
             };
             let knob_col = if sw_on {
-                Color32::from_rgb(225, 185, 255)
+                lighten(sw_col)
+            } else if self.theme.is_dark {
+                Color32::from_gray(145)
             } else {
                 Color32::from_gray(135)
             };
@@ -1827,10 +2058,21 @@ impl Canvas {
                             }
                         }
                         for note in &self.notes {
-                            if note.kind == NoteKind::Text {
-                                let (cr, _) = comment_rect_and_galley(&painter, origin, z, note);
-                                if cr.intersects(bx) {
-                                    self.sel_notes.insert(note.id);
+                            match note.kind {
+                                NoteKind::Text => {
+                                    let (cr, _) = comment_rect_and_galley(&painter, origin, z, note);
+                                    if cr.intersects(bx) {
+                                        self.sel_notes.insert(note.id);
+                                    }
+                                }
+                                NoteKind::Block => {
+                                    let br = Rect::from_min_size(
+                                        origin + vec2(note.pos.0, note.pos.1) * z,
+                                        vec2(note.size.0, note.size.1) * z,
+                                    );
+                                    if bx.contains_rect(br) {
+                                        self.sel_notes.insert(note.id);
+                                    }
                                 }
                             }
                         }
@@ -1849,9 +2091,16 @@ impl Canvas {
         // Drop selections that no longer exist.
         self.box_links.retain(|p| selectable.contains(p));
         self.sel_nodes.retain(|id| g.nodes.contains_key(id));
-        self.sel_notes.retain(|id| self.notes.iter().any(|n| n.id == *id && n.kind == NoteKind::Text));
-        if ui.input(|i| i.key_pressed(egui::Key::Delete)) && !self.box_links.is_empty() {
+        self.sel_notes.retain(|id| self.notes.iter().any(|n| n.id == *id));
+        let can_delete_key = !ui.ctx().wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete));
+        if can_delete_key && !self.box_links.is_empty() {
             self.extra_disconnects.extend(self.box_links.drain());
+        }
+        if can_delete_key && !self.sel_notes.is_empty() {
+            self.notes.retain(|n| !self.sel_notes.contains(&n.id));
+            self.sel_notes.clear();
+            self.group_sel = None;
+            self.dirty = true;
         }
 
         // Left-click selects the nearest link (Shift+click adds); click on empty space clears.
@@ -1906,7 +2155,7 @@ impl Canvas {
                 && !selectable.contains(&pair);
             if gone || !shapes.iter().any(|(p, _)| *p == pair) {
                 self.selected = None;
-            } else if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+            } else if can_delete_key {
                 let owned = self.virtual_mode
                     || selectable.contains(&pair)
                     || g.find_link(pair.0, pair.1).is_some_and(|l| g.is_owned(l));
@@ -1918,15 +2167,53 @@ impl Canvas {
         }
 
         // Pass 3: nodes.
+        let any_node_active = self.theme.node_glow_enabled
+            && items.iter().any(|it| g.is_node_active(it.node.id));
+        if any_node_active {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        }
         for it in &items {
             let r = it.rect;
             if !r.intersects(rect) {
                 continue;
             }
+            let is_active = g.is_node_active(it.node.id);
+            if is_active && self.theme.node_glow_enabled {
+                let glow_col = match layout::column_for(&it.node.media_class) {
+                    0 => self.theme.c_node_glow_source(),
+                    2 => self.theme.c_node_glow_sink(),
+                    _ => self.theme.c_node_glow_stream(),
+                };
+                for offset in [0.0_f32, 0.5_f32] {
+                    let t = (time * 0.6_f32 + offset).fract();
+                    let ease = 1.0_f32 - (1.0_f32 - t) * (1.0_f32 - t);
+                    let expanded = r.expand((2.0_f32 + 8.0_f32 * ease) * z);
+                    let alpha = ((1.0_f32 - t).powi(2) * 55.0_f32) as u8;
+                    let stroke_col = Color32::from_rgba_unmultiplied(
+                        glow_col.r(),
+                        glow_col.g(),
+                        glow_col.b(),
+                        alpha,
+                    );
+                    let fill_col = Color32::from_rgba_unmultiplied(
+                        glow_col.r(),
+                        glow_col.g(),
+                        glow_col.b(),
+                        alpha / 5,
+                    );
+                    painter.rect_filled(expanded, CornerRadius::same(10), fill_col);
+                    painter.rect_stroke(
+                        expanded,
+                        CornerRadius::same(10),
+                        Stroke::new((1.5_f32 * (1.0_f32 - 0.4_f32 * t) * z).max(0.8_f32), stroke_col),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
             let default_color = match layout::column_for(&it.node.media_class) {
-                0 => Color32::from_rgb(46, 125, 98),
-                2 => Color32::from_rgb(176, 104, 52),
-                _ => Color32::from_rgb(84, 88, 112),
+                0 => self.theme.c_col_source(),
+                2 => self.theme.c_col_sink(),
+                _ => self.theme.c_col_stream(),
             };
             let header_color = it.color.unwrap_or(default_color);
             // Soft shadow, thin border, body, then the colored header with a
@@ -1934,20 +2221,21 @@ impl Canvas {
             painter.rect_filled(
                 r.translate(vec2(0.0, 3.0 * z)).expand(3.0 * z),
                 CornerRadius::same(9),
-                Color32::from_black_alpha(55),
+                Color32::from_black_alpha(if self.theme.is_dark { 55 } else { 25 }),
             );
             if self.sel_nodes.contains(&it.node.id) {
                 painter.rect_filled(
                     r.expand(3.0 * z),
                     CornerRadius::same(9),
-                    Color32::from_rgba_unmultiplied(92, 196, 230, 150),
+                    self.theme.c32_alpha(self.theme.accent, 150),
                 );
             }
-            painter.rect_filled(r.expand(z), CornerRadius::same(7), Color32::from_gray(72));
+            painter.rect_filled(r.expand(z), CornerRadius::same(7), self.theme.c_node_stroke());
             // Nickname tab above the top-left corner, drawn BEFORE the node body and
             // reaching down behind the header, so it looks fused to the node and a
             // node drawn on top of it covers both. Click the pencil to rename.
             let show_text = z >= 0.4;
+            let ndelta = self.theme.node_font_size_delta;
             if !it.node.name.is_empty() {
                 let nkey = it.node.key();
                 let nick = self
@@ -1958,7 +2246,7 @@ impl Canvas {
                 let tab_h = layout::TAB_H * z;
                 let lift = 3.0 * z; // sits a little higher above the header
                 let text_g = nick.as_ref().filter(|_| show_text).map(|n| {
-                    painter.layout_no_wrap(n.clone(), FontId::proportional(11.0 * z), Color32::WHITE)
+                    painter.layout_no_wrap(n.clone(), FontId::proportional((11.0 + ndelta).max(7.0) * z), Color32::WHITE)
                 });
                 let text_w = text_g.as_ref().map_or(0.0, |g| g.size().x + 6.0 * z);
                 let tab_w = (text_w + 22.0 * z).min(r.width());
@@ -1972,7 +2260,7 @@ impl Canvas {
                     .on_hover_text("Rename (nickname)");
                 let fill = if resp.hovered() { lighten(header_color) } else { header_color };
                 let top = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
-                painter.rect_filled(full.expand(z), top, Color32::from_gray(72));
+                painter.rect_filled(full.expand(z), top, self.theme.c_node_stroke());
                 painter.rect_filled(full, top, fill);
                 painter.rect_filled(
                     Rect::from_min_size(tab.min, vec2(tab.width(), tab.height() / 2.0)),
@@ -1985,7 +2273,7 @@ impl Canvas {
                 }
                 // Pencil, drawn with lines so it needs no special font.
                 let c = pos2(tab.max.x - 11.0 * z, tab.center().y);
-                let ps = Stroke::new((1.6 * z).max(1.0), Color32::from_gray(205));
+                let ps = Stroke::new((1.6 * z).max(1.0), Color32::from_white_alpha(220));
                 painter.line_segment([c + vec2(-3.5, 3.5) * z, c + vec2(3.0, -3.0) * z], ps);
                 painter.line_segment([c + vec2(-4.5, 5.5) * z, c + vec2(1.0, 5.5) * z], ps);
                 if resp.clicked() {
@@ -1994,7 +2282,7 @@ impl Canvas {
                     self.edit_first = true;
                 }
             }
-            painter.rect_filled(r, CornerRadius::same(6), Color32::from_rgb(38, 40, 48));
+            painter.rect_filled(r, CornerRadius::same(6), self.theme.c_node_body());
             let header = Rect::from_min_size(r.min, vec2(r.width(), it.header_h * z));
             let top_round = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
             painter.rect_filled(header, top_round, header_color);
@@ -2005,13 +2293,13 @@ impl Canvas {
             );
             painter.line_segment(
                 [header.left_bottom(), header.right_bottom()],
-                Stroke::new(1.0_f32, Color32::from_black_alpha(90)),
+                Stroke::new(1.0_f32, Color32::from_black_alpha(if self.theme.is_dark { 90 } else { 40 })),
             );
 
             let clip = painter.with_clip_rect(r.intersect(rect));
             if show_text {
                 let white = Color32::WHITE;
-                let g = lay(it.node.label(), FontId::proportional(13.0 * z), white, (it.w - 16.0) * z);
+                let g = lay(it.node.label(), FontId::proportional((13.0 + ndelta).max(8.0) * z), white, (it.w - 16.0) * z);
                 let pos = r.min + vec2(8.0 * z, (it.header_h * z - g.size().y) / 2.0);
                 clip.galley(pos, g, white);
             }
@@ -2024,21 +2312,33 @@ impl Canvas {
             for (port, is_out) in ports {
                 let Some(&a) = anchors.get(&port.id) else { continue };
                 let color = if is_out {
-                    Color32::from_rgb(110, 210, 140)
+                    self.theme.c_port_out()
                 } else {
-                    Color32::from_rgb(240, 170, 90)
+                    self.theme.c_port_in()
                 };
-                painter.circle(a, 4.5 * z, color, Stroke::new(1.5 * z, Color32::from_rgb(24, 25, 30)));
+                painter.circle(
+                    a,
+                    4.5 * z,
+                    color,
+                    Stroke::new(
+                        1.5 * z,
+                        if self.theme.is_dark {
+                            Color32::from_rgb(24, 25, 30)
+                        } else {
+                            Color32::from_rgb(210, 212, 220)
+                        },
+                    ),
+                );
                 if show_text {
-                    let gray = Color32::from_gray(210);
-                    let g = lay(&port.name, FontId::proportional(11.0 * z), gray, half * z);
+                    let port_col = self.theme.c_node_text();
+                    let g = lay(&port.name, FontId::proportional((11.0 + ndelta).max(7.0) * z), port_col, half * z);
                     let dy = -g.size().y / 2.0;
                     let pos = if is_out {
                         a + vec2(-8.0 * z - g.size().x, dy)
                     } else {
                         a + vec2(8.0 * z, dy)
                     };
-                    clip.galley(pos, g, gray);
+                    clip.galley(pos, g, port_col);
                 }
             }
 
@@ -2082,9 +2382,15 @@ impl Canvas {
                 }
 
                 let (track_col, fill_col) = if vol.mute {
-                    (Color32::from_gray(55), Color32::from_gray(100))
+                    (
+                        if self.theme.is_dark { Color32::from_gray(55) } else { Color32::from_gray(215) },
+                        Color32::from_gray(100),
+                    )
                 } else {
-                    (Color32::from_gray(58), Color32::from_rgb(92, 196, 230))
+                    (
+                        if self.theme.is_dark { Color32::from_gray(58) } else { Color32::from_gray(215) },
+                        self.theme.c_accent(),
+                    )
                 };
                 painter.rect_filled(track, CornerRadius::same(3), track_col);
                 let frac = (s / volume::SLIDER_MAX).clamp(0.0, 1.0);
@@ -2113,8 +2419,8 @@ impl Canvas {
                 }
                 if show_text {
                     let text = if vol.mute { "muted".to_string() } else { format!("{}%", volume::percent(s)) };
-                    let col = if vol.mute { Color32::from_rgb(230, 120, 110) } else { Color32::from_gray(210) };
-                    let g = lay(&text, FontId::proportional(11.0 * z), col, 1000.0);
+                    let col = if vol.mute { Color32::from_rgb(230, 120, 110) } else { self.theme.c_node_text() };
+                    let g = lay(&text, FontId::proportional((11.0 + ndelta).max(7.0) * z), col, 1000.0);
                     let pos = pos2(label.min.x, (top + bottom) / 2.0 - g.size().y / 2.0);
                     clip.galley(pos, g, col);
                 }
@@ -2147,7 +2453,7 @@ impl Canvas {
                 painter.rect_filled(
                     r.expand(3.0 * z),
                     CornerRadius::same(9),
-                    Color32::from_rgba_unmultiplied(92, 196, 230, 150),
+                    self.theme.c32_alpha(self.theme.accent, 150),
                 );
             }
             painter.rect_filled(r, CornerRadius::same(6), Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 235));
@@ -2238,14 +2544,14 @@ impl Canvas {
                 let pts = link_path(self.link_style, s, &[], e, z, 0);
                 painter.add(Shape::line(
                     pts,
-                    Stroke::new((2.4 * z).clamp(1.2, 3.4), Color32::from_rgb(255, 206, 84)),
+                    Stroke::new((2.4 * z).clamp(1.2, 3.4), self.theme.c_cable_selected()),
                 ));
                 if let Some(tid) = target_port {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
                     let port_col = if from.from_out {
-                        Color32::from_rgb(240, 170, 90) // target is an input port
+                        self.theme.c_port_in() // target is an input port
                     } else {
-                        Color32::from_rgb(110, 210, 140) // target is an output port
+                        self.theme.c_port_out() // target is an output port
                     };
                     let mut ping_ports = vec![tid];
                     if ui.input(|i| i.modifiers.shift) {
@@ -2352,12 +2658,12 @@ impl Canvas {
                     painter.rect_filled(
                         bx,
                         CornerRadius::same(3),
-                        Color32::from_rgba_unmultiplied(255, 206, 84, 28),
+                        self.theme.c32_alpha(self.theme.cable_selected, 28),
                     );
                     painter.rect_stroke(
                         bx,
                         CornerRadius::same(3),
-                        Stroke::new(1.5_f32, Color32::from_rgb(255, 206, 84)),
+                        Stroke::new(1.5_f32, self.theme.c_cable_selected()),
                         egui::StrokeKind::Inside,
                     );
                     if bx.width() > 60.0 && bx.height() > 24.0 {
@@ -2366,19 +2672,19 @@ impl Canvas {
                             egui::Align2::LEFT_TOP,
                             "Fit box to screen",
                             FontId::proportional(11.0),
-                            Color32::from_rgb(255, 206, 84),
+                            self.theme.c_cable_selected(),
                         );
                     }
                 } else {
                     painter.rect_filled(
                         bx,
                         CornerRadius::same(2),
-                        Color32::from_rgba_unmultiplied(92, 196, 230, 30),
+                        self.theme.c32_alpha(self.theme.accent, 30),
                     );
                     painter.rect_stroke(
                         bx,
                         CornerRadius::same(2),
-                        Stroke::new(1.0_f32, Color32::from_rgb(92, 196, 230)),
+                        Stroke::new(1.0_f32, self.theme.c_accent()),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -2434,13 +2740,7 @@ impl Canvas {
             painter.rect_filled(
                 map_rect,
                 CornerRadius::same(8),
-                Color32::from_rgba_unmultiplied(24, 26, 32, 220),
-            );
-            painter.rect_stroke(
-                map_rect,
-                CornerRadius::same(8),
-                Stroke::new(1.0_f32, Color32::from_gray(64)),
-                egui::StrokeKind::Inside,
+                self.theme.c32_alpha(self.theme.panel_bg, 220),
             );
 
             let mp = painter.with_clip_rect(inner);
@@ -2461,10 +2761,15 @@ impl Canvas {
                     let (w, h) = self.node_sizes.get(&it.node.id).copied().unwrap_or((it.w, 60.0));
                     let a = to_map(x, y);
                     let b = to_map(x + w, y + h);
+                    let default_col = match layout::column_for(&it.node.media_class) {
+                        0 => self.theme.c_col_source(),
+                        2 => self.theme.c_col_sink(),
+                        _ => self.theme.c_col_stream(),
+                    };
                     let col = if self.sel_nodes.contains(&it.node.id) {
-                        Color32::from_rgb(92, 196, 230)
+                        self.theme.c_accent()
                     } else {
-                        it.color.unwrap_or(Color32::from_gray(130))
+                        it.color.unwrap_or(default_col)
                     };
                     mp.rect_filled(Rect::from_min_max(a, b), CornerRadius::same(2), col);
                 }
@@ -2476,7 +2781,7 @@ impl Canvas {
             mp.rect_stroke(
                 vp_rect,
                 CornerRadius::same(2),
-                Stroke::new(1.2_f32, Color32::from_rgb(92, 196, 230)),
+                Stroke::new(1.2_f32, self.theme.c_accent()),
                 egui::StrokeKind::Inside,
             );
 
@@ -2606,9 +2911,12 @@ impl Canvas {
         anchors
             .iter()
             .filter(|(id, _)| {
-                g.ports.get(id).is_some_and(|p| {
-                    p.node_id != src_node && (p.direction == Direction::Out) != from.from_out
-                })
+                let Some(p) = g.ports.get(id) else { return false };
+                if p.node_id == src_node || (p.direction == Direction::Out) == from.from_out {
+                    return false;
+                }
+                let (out_p, in_p) = if from.from_out { (from.port, **id) } else { (**id, from.port) };
+                g.can_link_ports(out_p, in_p)
             })
             .map(|(id, a)| (*id, a.distance(pos)))
             .filter(|(_, d)| *d <= reach)
@@ -2631,5 +2939,15 @@ mod tests {
         assert_eq!(before.last().copied(), Some(mid));
         assert_eq!(after.first().copied(), Some(mid));
         assert_eq!(after.last().copied(), Some(pos2(10.0, 20.0)));
+    }
+
+    #[test]
+    fn polyline_ribbon_mesh_generation() {
+        let pts = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0)];
+        let mesh = build_polyline_ribbon(&pts, 4.0, Color32::RED, Color32::BLUE, None);
+        assert_eq!(mesh.vertices.len(), 6);
+        assert_eq!(mesh.indices.len(), 12);
+        assert_eq!(mesh.vertices[0].color, Color32::RED);
+        assert_eq!(mesh.vertices[5].color, Color32::BLUE);
     }
 }
