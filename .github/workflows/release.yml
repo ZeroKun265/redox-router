@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Release x86_64-linux
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpipewire-0.3-dev \
+            libclang-dev \
+            pkg-config
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare release bundle
+        run: |
+          VERSION="${GITHUB_REF_NAME:-v0.2.0}"
+          BUNDLE="redox-router-${VERSION}-x86_64-linux"
+          mkdir -p "${BUNDLE}"
+
+          strip target/release/redox-router
+          cp target/release/redox-router "${BUNDLE}/"
+          cp LICENSE README.md "${BUNDLE}/"
+          mkdir -p "${BUNDLE}/extra"
+          cp extra/redox-router.desktop extra/redox-router.svg extra/redox-router.png extra/install.sh extra/uninstall.sh "${BUNDLE}/extra/"
+          chmod +x "${BUNDLE}/extra/install.sh" "${BUNDLE}/extra/uninstall.sh"
+
+          # Create generic symlink/copy for stable download URLs
+          tar -czvf "redox-router-x86_64-linux.tar.gz" -C "${BUNDLE}" .
+          cp "redox-router-x86_64-linux.tar.gz" "${BUNDLE}.tar.gz"
+
+          sha256sum "redox-router-x86_64-linux.tar.gz" > "redox-router-x86_64-linux.tar.gz.sha256"
+          sha256sum "${BUNDLE}.tar.gz" > "${BUNDLE}.tar.gz.sha256"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            redox-router-x86_64-linux.tar.gz
+            redox-router-x86_64-linux.tar.gz.sha256
+            redox-router-*.tar.gz
+            redox-router-*.tar.gz.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true

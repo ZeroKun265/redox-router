@@ -1,0 +1,42 @@
+# Maintainer: ZeroKun265 <davidegiambirtone265@gmail.com>
+pkgname=redox-router
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="A node-based PipeWire patchbay (qpwgraph alternative) with clean ownership and smart routing"
+arch=('x86_64')
+url="https://github.com/ZeroKun265/redox-router"
+license=('MIT')
+depends=('pipewire' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'pkgconf' 'clang')
+provides=('redox-router')
+conflicts=('redox-router-bin' 'redox-router-git')
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/ZeroKun265/redox-router/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "${pkgname}-${pkgver}"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "${pkgname}-${pkgver}"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --all-targets
+}
+
+check() {
+    cd "${pkgname}-${pkgver}"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen
+}
+
+package() {
+    cd "${pkgname}-${pkgver}"
+    install -Dm755 "target/release/redox-router" "${pkgdir}/usr/bin/redox-router"
+    install -Dm644 "extra/redox-router.desktop" "${pkgdir}/usr/share/applications/redox-router.desktop"
+    install -Dm644 "extra/redox-router.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/redox-router.svg"
+    install -Dm644 "extra/redox-router.png" "${pkgdir}/usr/share/icons/hicolor/128x128/apps/redox-router.png"
+    install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

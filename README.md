@@ -32,8 +32,9 @@ Created by **ZeroKun265** as a fast, clean, and deeply customizable replacement 
 3. [Mouse & Keyboard Shortcuts Reference](#mouse--keyboard-shortcuts-reference)
 4. [CLI Reference](#cli-reference)
 5. [Configuration & Storage Files](#configuration--storage-files)
-6. [Building & Running](#building--running)
-7. [AI Usage](#ai-usage)
+6. [Installation](#installation)
+7. [Building from Source](#building-from-source)
+8. [AI Usage](#ai-usage)
 
 ---
 
@@ -317,18 +318,75 @@ All configuration is saved atomically (via temporary file + rename) under `~/.co
 
 ---
 
-## Building & Running
+## Installation
+
+### Arch Linux (AUR)
+RedoxRouter is available on the Arch User Repository:
+
+```bash
+# Precompiled binary (fastest, no Rust toolchain needed):
+yay -S redox-router-bin
+# or
+paru -S redox-router-bin
+
+# Or build from source via AUR:
+yay -S redox-router
+```
+
+### Precompiled Binary (Universal Linux)
+Prebuilt tarballs with `.desktop` and icon integration are available on the [GitHub Releases](https://github.com/ZeroKun265/redox-router/releases) page.
+
+```bash
+# 1. Download and extract the latest release
+tar -xzf redox-router-x86_64-linux.tar.gz
+cd redox-router-*
+
+# 2. Run directly:
+./redox-router
+
+# 3. (Optional) Install system-wide or for current user:
+sudo ./extra/install.sh       # Installs to /usr/local
+# or
+./extra/install.sh --user     # Installs to ~/.local
+```
+
+### Cargo Install
+If you have a Rust toolchain installed:
+
+```bash
+cargo install --git https://github.com/ZeroKun265/redox-router
+```
+
+---
+
+## Building from Source
 
 ### Prerequisites
 - Rust toolchain (`cargo`, `rustc` 2021 edition)
-- PipeWire development headers (`libpipewire-0.3-dev` on Debian/Ubuntu, `pipewire-devel` on Fedora, `pipewire` on Arch) and `pkg-config` / `clang` (required by `pipewire-sys` bindgen)
+- PipeWire development headers (`libpipewire-0.3-dev` on Debian/Ubuntu, `pipewire-devel` on Fedora, `pipewire` on Arch)
+- Build tools: `pkg-config`, `clang` (required for `pipewire-sys` bindgen)
+
+```bash
+# Debian / Ubuntu / Pop!_OS
+sudo apt install libpipewire-0.3-dev libclang-dev pkg-config
+
+# Fedora / RHEL
+sudo dnf install pipewire-devel clang pkgconf-pkg-config
+
+# Arch Linux / Manjaro
+sudo pacman -S pipewire clang pkgconf
+```
 
 ### Build & Run
 ```bash
+# Clone the repository
+git clone https://github.com/ZeroKun265/redox-router.git
+cd redox-router
+
 # Run in release mode (recommended for smooth 60 FPS canvas rendering)
 cargo run --release
 
-# Run the unit test suite (78 unit tests covering graph, links, bleed, layout, rules, themes, CLI, storage)
+# Run the unit test suite (80 unit tests)
 cargo test
 ```
 

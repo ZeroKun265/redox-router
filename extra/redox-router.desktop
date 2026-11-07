@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RedoxRouter
+GenericName=PipeWire Patchbay
+Comment=Node-based PipeWire audio, video & MIDI patchbay
+Exec=redox-router %u
+Icon=redox-router
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=pipewire;patchbay;audio;routing;qpwgraph;helvum;mixer;
+StartupWMClass=redox-router
