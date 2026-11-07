@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["ZeroKun265"]
 description = "RedoxRouter - a node-based PipeWire patchbay (qpwgraph alternative) adding many QOL features for specific control"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

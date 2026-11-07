@@ -33,3 +33,4 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 fi
 
 echo "Done! RedoxRouter removed from $PREFIX"
+

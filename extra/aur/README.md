@@ -58,3 +58,4 @@ yay -S redox-router-bin
 # or
 paru -S redox-router-bin
 ```
+

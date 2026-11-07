@@ -9,3 +9,4 @@ Terminal=false
 Categories=AudioVideo;Audio;Mixer;
 Keywords=pipewire;patchbay;audio;routing;qpwgraph;helvum;mixer;
 StartupWMClass=redox-router
+
