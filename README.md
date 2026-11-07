@@ -357,6 +357,11 @@ cd redox-router-*
 sudo ./extra/install.sh       # Installs to /usr/local
 # or
 ./extra/install.sh --user     # Installs to ~/.local
+
+# 4. To uninstall later:
+sudo ./extra/uninstall.sh     # Removes from /usr/local
+# or
+./extra/uninstall.sh --user   # Removes from ~/.local
 ```
 
 ### Cargo Install
