@@ -2284,6 +2284,44 @@ impl Canvas {
                     self.edit_first = true;
                 }
             }
+            if self.virtual_mode && g.is_node_owned(it.node) {
+                let tab_h = layout::TAB_H * z;
+                let lift = 3.0 * z;
+                let info_w = 22.0 * z;
+                let info_tab = Rect::from_min_size(
+                    pos2(r.max.x - info_w, r.max.y),
+                    vec2(info_w, tab_h + lift),
+                );
+                let info_full = Rect::from_min_max(
+                    pos2(info_tab.min.x, r.max.y - 12.0 * z),
+                    info_tab.max,
+                );
+                let info_resp = ui
+                    .interact(info_tab, ui.id().with(("virt_info", it.node.id)), Sense::hover())
+                    .on_hover_text(
+                        "Virtual nodes are per-tab and only show up as live nodes in PipeWire \
+                         (and external tools like qpwgraph) when this setup tab is active.\n\
+                         Click \"Make active\" in the tab bar to make this tab and its virtual nodes live.",
+                    );
+                let base_gray = if self.theme.is_dark {
+                    Color32::from_rgb(76, 80, 92)
+                } else {
+                    Color32::from_rgb(165, 170, 182)
+                };
+                let info_fill = if info_resp.hovered() {
+                    lighten(base_gray)
+                } else {
+                    base_gray
+                };
+                let bottom_round = CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 };
+                painter.rect_filled(info_full.expand(z), bottom_round, self.theme.c_node_stroke());
+                painter.rect_filled(info_full, bottom_round, info_fill);
+                let ic = info_tab.center();
+                let icon_col = Color32::from_white_alpha(230);
+                let is_stroke = Stroke::new((1.8_f32 * z).max(1.1_f32), icon_col);
+                painter.circle_filled(ic + vec2(0.0, -4.0 * z), (1.3_f32 * z).max(1.0_f32), icon_col);
+                painter.line_segment([ic + vec2(0.0, -1.0 * z), ic + vec2(0.0, 4.5 * z)], is_stroke);
+            }
             painter.rect_filled(r, CornerRadius::same(6), self.theme.c_node_body());
             let header = Rect::from_min_size(r.min, vec2(r.width(), it.header_h * z));
             let top_round = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
