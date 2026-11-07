@@ -1,6 +1,6 @@
 [package]
 name = "redox-router"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["ZeroKun265"]
 description = "RedoxRouter - a node-based PipeWire patchbay (qpwgraph alternative) adding many QOL features for specific control"

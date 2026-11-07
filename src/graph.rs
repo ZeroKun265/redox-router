@@ -235,7 +235,7 @@ impl NodeVolume {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Graph {
     pub nodes: BTreeMap<u32, NodeInfo>,
     pub ports: BTreeMap<u32, PortInfo>,
@@ -397,6 +397,115 @@ impl Graph {
             .values()
             .filter(|p| p.node_id == node_id && p.direction == dir)
             .collect()
+    }
+
+    /// Graph view for a setup tab.
+    /// - When `is_active` is `true`, returns `self` directly (live PipeWire state).
+    /// - When `is_active` is `false`, hides live Redox-owned virtual devices that do
+    ///   not belong to the inactive setup and synthesizes preview nodes + stereo ports
+    ///   for the inactive setup's `virtual_devices` so they can be arranged and wired
+    ///   on the canvas without existing in PipeWire (`qpwgraph`) until activated.
+    pub fn for_setup<'a>(
+        &'a self,
+        is_active: bool,
+        virtual_devices: &[crate::storage::SavedSink],
+    ) -> std::borrow::Cow<'a, Graph> {
+        if is_active {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            std::borrow::Cow::Owned(self.for_inactive_setup(virtual_devices))
+        }
+    }
+
+    pub fn for_inactive_setup(&self, virtual_devices: &[crate::storage::SavedSink]) -> Graph {
+        let mut g = self.clone();
+        let matches_dev = |n: &NodeInfo, d: &crate::storage::SavedSink| -> bool {
+            n.name == d.name
+                && match d.kind {
+                    crate::storage::VirtualDeviceKind::Sink => n.is_sink(),
+                    crate::storage::VirtualDeviceKind::Source => n.is_source(),
+                }
+        };
+
+        let remove_nodes: Vec<u32> = g
+            .nodes
+            .values()
+            .filter(|n| g.is_node_owned(n) && !virtual_devices.iter().any(|d| matches_dev(n, d)))
+            .map(|n| n.id)
+            .collect();
+        for nid in remove_nodes {
+            g.nodes.remove(&nid);
+            g.owned_node_ids.remove(&nid);
+            g.volumes.remove(&nid);
+            g.running_nodes.remove(&nid);
+            g.ports.retain(|_, p| p.node_id != nid);
+            g.links.retain(|_, l| l.out_node != nid && l.in_node != nid);
+        }
+
+        for (idx, dev) in virtual_devices.iter().enumerate() {
+            let existing_id = g
+                .nodes
+                .values()
+                .find(|n| g.is_node_owned(n) && matches_dev(n, dev))
+                .map(|n| n.id);
+            if let Some(id) = existing_id {
+                if let Some(n) = g.nodes.get_mut(&id) {
+                    n.description = dev.description.clone();
+                }
+                continue;
+            }
+            let node_id = 0xF000_0000_u32 + (idx as u32) * 8;
+            let (media_class, in_ports, out_ports) = match dev.kind {
+                crate::storage::VirtualDeviceKind::Sink => (
+                    "Audio/Sink".to_string(),
+                    ["playback_FL", "playback_FR"],
+                    ["monitor_FL", "monitor_FR"],
+                ),
+                crate::storage::VirtualDeviceKind::Source => (
+                    "Audio/Source/Virtual".to_string(),
+                    ["input_FL", "input_FR"],
+                    ["capture_FL", "capture_FR"],
+                ),
+            };
+            g.owned_node_ids.insert(node_id);
+            g.nodes.insert(
+                node_id,
+                NodeInfo {
+                    id: node_id,
+                    name: dev.name.clone(),
+                    description: dev.description.clone(),
+                    media_class,
+                    device_id: None,
+                    profile_device: None,
+                    is_owned: true,
+                },
+            );
+            for (k, pname) in in_ports.iter().enumerate() {
+                let pid = node_id + 1 + k as u32;
+                g.ports.insert(
+                    pid,
+                    PortInfo {
+                        id: pid,
+                        node_id,
+                        name: (*pname).to_string(),
+                        direction: Direction::In,
+                    },
+                );
+            }
+            for (k, pname) in out_ports.iter().enumerate() {
+                let pid = node_id + 3 + k as u32;
+                g.ports.insert(
+                    pid,
+                    PortInfo {
+                        id: pid,
+                        node_id,
+                        name: (*pname).to_string(),
+                        direction: Direction::Out,
+                    },
+                );
+            }
+        }
+        g
     }
 }
 
@@ -709,5 +818,44 @@ mod tests {
         // Same direction or same node rejected:
         assert!(!g.can_link_ports(10, 10));
         assert!(!g.can_link_ports(30, 20));
+    }
+
+    #[test]
+    fn inactive_setup_graph_isolates_virtual_devices() {
+        let mut g = Graph::default();
+        // Active setup has a live Redox virtual sink #50
+        g.apply(Event::NodeAdded(NodeInfo {
+            id: 50,
+            name: "Active_Sink".into(),
+            description: "Active Sink".into(),
+            media_class: "Audio/Sink".into(),
+            device_id: None,
+            profile_device: None,
+            is_owned: true,
+        }));
+        g.apply(Event::PortAdded(PortInfo {
+            id: 51,
+            node_id: 50,
+            name: "playback_FL".into(),
+            direction: Direction::In,
+        }));
+        // Inactive setup wants a different virtual sink ("Inactive_Sink")
+        let inactive_devs = vec![crate::storage::SavedSink {
+            name: "Inactive_Sink".into(),
+            description: "Inactive Sink".into(),
+            kind: crate::storage::VirtualDeviceKind::Sink,
+        }];
+        let view = g.for_inactive_setup(&inactive_devs);
+        // Active_Sink (#50) is hidden on the inactive setup's view:
+        assert!(!view.nodes.contains_key(&50));
+        // Inactive_Sink is synthesized with its 4 stereo ports:
+        let synth = view
+            .nodes
+            .values()
+            .find(|n| n.name == "Inactive_Sink")
+            .expect("synthesized virtual sink present");
+        assert!(view.is_node_owned(synth));
+        assert_eq!(view.ports_of(synth.id, Direction::In).len(), 2);
+        assert_eq!(view.ports_of(synth.id, Direction::Out).len(), 2);
     }
 }

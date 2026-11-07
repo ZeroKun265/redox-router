@@ -300,23 +300,69 @@ impl RedoxRouter {
     }
 
     fn destroy_sink(&mut self, node_id: u32) {
-        if let Some(n) = self.graph.nodes.get(&node_id) {
-            self.canvas.virtual_devices.retain(|s| s.name != n.name);
-            if self.viewing != self.setups.active {
-                self.setups.items[self.setups.active]
-                    .data
-                    .virtual_devices
-                    .retain(|s| s.name != n.name);
-            }
-            self.canvas.dirty = true;
-            let active_devs = if self.viewing == self.setups.active {
-                &self.canvas.virtual_devices
-            } else {
-                &self.setups.items[self.setups.active].data.virtual_devices
-            };
-            let _ = storage::save_sinks(active_devs);
+        let is_active = self.viewing == self.setups.active;
+        let cg = self.graph.for_setup(is_active, &self.canvas.virtual_devices);
+        let Some(n) = cg.nodes.get(&node_id).cloned() else {
+            return;
+        };
+        if !cg.is_node_owned(&n) {
+            return;
         }
-        self.send(Command::DestroySink { node_id });
+        let key = n.key();
+        let name = n.name.clone();
+        let is_sink = n.is_sink();
+        self.canvas.virtual_devices.retain(|s| {
+            !(s.name == name
+                && match s.kind {
+                    storage::VirtualDeviceKind::Sink => is_sink,
+                    storage::VirtualDeviceKind::Source => !is_sink,
+                })
+        });
+        // Destroy all saved links connected to this Redox virtual node in the viewed setup.
+        self.canvas.links.retain(|l| {
+            l.out_node != key
+                && l.out_node != name
+                && l.in_node != key
+                && l.in_node != name
+        });
+        self.canvas.dirty = true;
+
+        if is_active {
+            // Destroy all live PipeWire links connected to this Redox virtual node.
+            let live_links: Vec<(u32, u32, u32)> = self
+                .graph
+                .links
+                .values()
+                .filter(|l| l.out_node == node_id || l.in_node == node_id)
+                .map(|l| (l.id, l.out_port, l.in_port))
+                .collect();
+            for (link_id, out_port, in_port) in live_links {
+                self.requested.remove(&(out_port, in_port));
+                self.graph.owned_pairs.remove(&(out_port, in_port));
+                self.canvas.revealed.remove(&(out_port, in_port));
+                self.send(Command::DestroyLink {
+                    link_id: Some(link_id),
+                    out_port,
+                    in_port,
+                });
+            }
+            let node_ports: HashSet<u32> = self
+                .graph
+                .ports
+                .values()
+                .filter(|p| p.node_id == node_id)
+                .map(|p| p.id)
+                .collect();
+            self.requested
+                .retain(|&(o, i)| !node_ports.contains(&o) && !node_ports.contains(&i));
+            self.graph
+                .owned_pairs
+                .retain(|&(o, i)| !node_ports.contains(&o) && !node_ports.contains(&i));
+            let _ = storage::save_sinks(&self.canvas.virtual_devices);
+            if self.graph.nodes.contains_key(&node_id) {
+                self.send(Command::DestroySink { node_id });
+            }
+        }
     }
 
     /// Reconcile live Redox-owned virtual sinks/mics in PipeWire with the active setup's `virtual_devices`.
@@ -331,18 +377,45 @@ impl RedoxRouter {
             .nodes
             .values()
             .filter(|n| self.graph.is_node_owned(n))
-            .filter(|n| !desired.iter().any(|d| d.name == n.name))
+            .filter(|n| {
+                !desired.iter().any(|d| {
+                    d.name == n.name
+                        && match d.kind {
+                            storage::VirtualDeviceKind::Sink => n.is_sink(),
+                            storage::VirtualDeviceKind::Source => n.is_source(),
+                        }
+                })
+            })
             .map(|n| n.id)
             .collect();
         for node_id in to_destroy {
+            let live_links: Vec<(u32, u32, u32)> = self
+                .graph
+                .links
+                .values()
+                .filter(|l| l.out_node == node_id || l.in_node == node_id)
+                .map(|l| (l.id, l.out_port, l.in_port))
+                .collect();
+            for (link_id, out_port, in_port) in live_links {
+                self.requested.remove(&(out_port, in_port));
+                self.graph.owned_pairs.remove(&(out_port, in_port));
+                self.send(Command::DestroyLink {
+                    link_id: Some(link_id),
+                    out_port,
+                    in_port,
+                });
+            }
             self.send(Command::DestroySink { node_id });
         }
         for dev in &desired {
-            let already_live = self
-                .graph
-                .nodes
-                .values()
-                .any(|n| self.graph.is_node_owned(n) && n.name == dev.name);
+            let already_live = self.graph.nodes.values().any(|n| {
+                self.graph.is_node_owned(n)
+                    && n.name == dev.name
+                    && match dev.kind {
+                        storage::VirtualDeviceKind::Sink => n.is_sink(),
+                        storage::VirtualDeviceKind::Source => n.is_source(),
+                    }
+            });
             if !already_live {
                 let cmd = match dev.kind {
                     storage::VirtualDeviceKind::Sink => Command::CreateSink {
@@ -377,19 +450,21 @@ impl RedoxRouter {
         } else {
             &mut self.canvas.virtual_devices
         };
-        if let Some(existing) = target_list.iter_mut().find(|s| s.name == dev.name) {
+        if let Some(existing) = target_list.iter_mut().find(|s| s.name == dev.name && s.kind == kind) {
             existing.description = dev.description;
-            existing.kind = kind;
         } else {
             target_list.push(dev);
         }
         self.canvas.dirty = true;
         if on_active || self.viewing == self.setups.active {
-            let already_live = self
-                .graph
-                .nodes
-                .values()
-                .any(|n| self.graph.is_node_owned(n) && n.name == name);
+            let already_live = self.graph.nodes.values().any(|n| {
+                self.graph.is_node_owned(n)
+                    && n.name == name
+                    && match kind {
+                        storage::VirtualDeviceKind::Sink => n.is_sink(),
+                        storage::VirtualDeviceKind::Source => n.is_source(),
+                    }
+            });
             if !already_live {
                 let cmd = match kind {
                     storage::VirtualDeviceKind::Sink => Command::CreateSink { name, description },
@@ -509,11 +584,16 @@ impl RedoxRouter {
             match action {
                 Action::Connect { out_port, in_port } => self.remember_link(out_port, in_port),
                 Action::Disconnect { out_port, in_port } => {
-                    if let Some(s) = links::from_ports(&self.graph, out_port, in_port) {
+                    let cg = self.graph.for_setup(false, &self.canvas.virtual_devices);
+                    if let Some(s) = links::from_ports(&cg, out_port, in_port) {
                         if links::remove(&mut self.canvas.links, &s) {
                             self.canvas.dirty = true;
                         }
                     }
+                }
+                Action::DestroySink { node_id } => {
+                    self.destroy_sink(node_id);
+                    return;
                 }
                 _ => {} // volume etc. stay live on every tab
             }
@@ -646,10 +726,13 @@ impl RedoxRouter {
 
     /// Save a connection of ours on the currently viewed canvas.
     fn remember_link(&mut self, out_port: u32, in_port: u32) {
-        if !self.graph.can_link_ports(out_port, in_port) {
+        let is_active = self.viewing == self.setups.active;
+        let cg = self.graph.for_setup(is_active, &self.canvas.virtual_devices);
+        if !cg.can_link_ports(out_port, in_port) {
             return;
         }
-        if let Some(s) = links::from_ports(&self.graph, out_port, in_port) {
+        if let Some(s) = links::from_ports(&cg, out_port, in_port) {
+            drop(cg);
             if links::add(&mut self.canvas.links, s) {
                 self.canvas.dirty = true;
             }
@@ -915,20 +998,22 @@ impl RedoxRouter {
     }
 
     fn render_tabs_bar_right(&mut self, ui: &mut egui::Ui) {
-        let sinks: Vec<(u32, String)> = self
+        let cg = self
             .graph
+            .for_setup(self.viewing == self.setups.active, &self.canvas.virtual_devices);
+        let sinks: Vec<(u32, String)> = cg
             .nodes
             .values()
-            .filter(|n| self.graph.is_node_owned(n) && n.is_sink())
+            .filter(|n| cg.is_node_owned(n) && n.is_sink())
             .map(|n| (n.id, format!("#{} {}", n.id, n.label())))
             .collect();
-        let mics: Vec<(u32, String)> = self
-            .graph
+        let mics: Vec<(u32, String)> = cg
             .nodes
             .values()
-            .filter(|n| self.graph.is_node_owned(n) && n.is_source())
+            .filter(|n| cg.is_node_owned(n) && n.is_source())
             .map(|n| (n.id, format!("#{} {}", n.id, n.label())))
             .collect();
+        drop(cg);
 
         // Tools popup menu: vertical list with left-opening hover flyouts
         ui.menu_button(egui::RichText::new("Tools").strong(), |ui| {
@@ -1232,8 +1317,8 @@ impl RedoxRouter {
                 self.sync_current();
                 let data = self.setups.items[i].data.clone();
                 let name = format!("{} copy", self.setups.items[i].name);
-                self.setups.add(&name, data);
-                self.canvas.dirty = true;
+                let new_i = self.setups.add(&name, data);
+                self.switch_to(new_i);
             }
             Some(TabOp::Rename(i)) => self.renaming = Some((i, self.setups.items[i].name.clone())),
             Some(TabOp::Export(i)) => {
@@ -1617,6 +1702,8 @@ impl RedoxRouter {
         let mut changed = false;
         let mut to_disconnect: Vec<(u32, u32)> = Vec::new();
         let mut to_linger: Vec<(u32, u32, bool)> = Vec::new();
+        let is_active = self.viewing == self.setups.active;
+        let cg = self.graph.for_setup(is_active, &self.canvas.virtual_devices);
         egui::Window::new("Saved links").open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.label(
                 "Links you create are saved by node and port name and reconnected when both \
@@ -1630,7 +1717,7 @@ impl RedoxRouter {
                     if ui.checkbox(&mut l.enabled, "").changed() {
                         changed = true;
                         if !l.enabled {
-                            if let Some(pair) = links::resolve(&self.graph, l) {
+                            if let Some(pair) = links::resolve(&cg, l) {
                                 to_disconnect.push(pair);
                             }
                         }
@@ -1652,16 +1739,15 @@ impl RedoxRouter {
                     {
                         changed = true;
                         if l.enabled {
-                            if let Some((o, n)) = links::resolve(&self.graph, l) {
+                            if let Some((o, n)) = links::resolve(&cg, l) {
                                 to_linger.push((o, n, l.lingering));
                             }
                         }
                     }
                     ui.label(l.label());
-                    let state = match links::resolve(&self.graph, l) {
+                    let state = match links::resolve(&cg, l) {
                         Some((o, n))
-                            if self.viewing == self.setups.active
-                                && self.graph.find_link(o, n).is_some() =>
+                            if is_active && self.graph.find_link(o, n).is_some() =>
                         {
                             "connected"
                         }
@@ -1676,6 +1762,7 @@ impl RedoxRouter {
                 });
             }
         });
+        drop(cg);
         if let Some(i) = remove {
             if self.viewing == self.setups.active {
                 if let Some(pair) = links::resolve(&self.graph, &self.canvas.links[i]) {
@@ -3096,9 +3183,13 @@ impl eframe::App for RedoxRouter {
         }
 
         let mut action = None;
+        let cg = self
+            .graph
+            .for_setup(self.viewing == self.setups.active, &self.canvas.virtual_devices);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ctx, |ui| action = self.canvas.show(ui, &self.graph));
+            .show(ctx, |ui| action = self.canvas.show(ui, &cg));
+        drop(cg);
         if let Some(a) = action {
             self.handle(a);
         }

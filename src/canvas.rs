@@ -1481,9 +1481,6 @@ impl Canvas {
         let mut selectable: HashSet<(u32, u32)> = HashSet::new();
         let mut handles: Vec<(usize, usize, Pos2)> = Vec::new();
         let mut switch_handles: Vec<(usize, (u32, u32), Pos2, bool, bool)> = Vec::new();
-        if !pairs.is_empty() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-        }
         for (pair, owned) in pairs {
             if !(owned || self.show_external || self.revealed.contains(&pair)) {
                 continue;
@@ -1613,6 +1610,9 @@ impl Canvas {
                 draw_flowing_dots(&painter, &pts, w_stroke, solid_col, grad, time);
                 shapes.push((pair, pts));
             }
+        }
+        if !shapes.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         // Waypoint handles of picked links: drag to move, double-click to remove.
@@ -2168,7 +2168,9 @@ impl Canvas {
 
         // Pass 3: nodes.
         let any_node_active = self.theme.node_glow_enabled
-            && items.iter().any(|it| g.is_node_active(it.node.id));
+            && items
+                .iter()
+                .any(|it| it.rect.intersects(rect) && g.is_node_active(it.node.id));
         if any_node_active {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         }

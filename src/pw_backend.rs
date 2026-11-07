@@ -418,9 +418,18 @@ fn run(
             }
             Command::DestroySink { node_id } => {
                 rlog!("command DestroySink node_id={node_id}");
-                owned_sinks_cmd.borrow_mut().retain(|os| {
-                    os.global_id.get() != Some(node_id)
-                });
+                let mut sinks = owned_sinks_cmd.borrow_mut();
+                let mut i = 0;
+                while i < sinks.len() {
+                    if sinks[i].global_id.get() == Some(node_id) {
+                        let OwnedSink { _listener, _node, .. } = sinks.remove(i);
+                        drop(_listener);
+                        let _ = core_cmd.destroy_object(_node);
+                    } else {
+                        i += 1;
+                    }
+                }
+                drop(sinks);
                 let _ = registry_cmd.destroy_global(node_id);
             }
         }
