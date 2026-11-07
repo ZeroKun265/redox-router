@@ -3224,6 +3224,63 @@ fn bar_frame(theme: &Theme) -> egui::Frame {
     theme.bar_frame()
 }
 
+fn load_app_icon() -> std::sync::Arc<egui::IconData> {
+    const RGBA: &[u8] = include_bytes!("icon/icon_64.rgba");
+    std::sync::Arc::new(egui::IconData {
+        rgba: RGBA.to_vec(),
+        width: 64,
+        height: 64,
+    })
+}
+
+/// On Wayland (KWin, Mutter, etc.), the compositor resolves a window's titlebar
+/// and taskbar icon via its `xdg_toplevel` `app_id` ("redox-router") matched
+/// against `~/.local/share/applications/redox-router.desktop` and the `hicolor`
+/// icon theme. Writing these on startup ensures the icon shows up even when
+/// running directly via `cargo run`.
+fn ensure_desktop_icon_installed() {
+    let Some(base) = directories::BaseDirs::new() else {
+        return;
+    };
+    let data_dir = base.data_local_dir();
+    let png_dir = data_dir.join("icons/hicolor/128x128/apps");
+    let svg_dir = data_dir.join("icons/hicolor/scalable/apps");
+    let apps_dir = data_dir.join("applications");
+
+    if std::fs::create_dir_all(&png_dir).is_ok() {
+        let _ = std::fs::write(
+            png_dir.join("redox-router.png"),
+            include_bytes!("icon/icon_128.png"),
+        );
+    }
+    if std::fs::create_dir_all(&svg_dir).is_ok() {
+        let svg = include_str!("icon/icon.svg").replacen(
+            "viewBox=\"0 0 796 450\" width=\"796\" height=\"450\"",
+            "viewBox=\"55 -116 700 700\" width=\"512\" height=\"512\"",
+            1,
+        );
+        let _ = std::fs::write(svg_dir.join("redox-router.svg"), svg);
+    }
+    if std::fs::create_dir_all(&apps_dir).is_ok() {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "redox-router".to_string());
+        let desktop = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=RedoxRouter\n\
+             Comment=Node-based PipeWire audio, video & MIDI patchbay\n\
+             Exec=\"{exe}\"\n\
+             Icon=redox-router\n\
+             Terminal=false\n\
+             Categories=AudioVideo;Audio;Mixer;\n\
+             StartupWMClass=redox-router\n"
+        );
+        let _ = std::fs::write(apps_dir.join("redox-router.desktop"), desktop);
+    }
+}
+
 fn main() -> eframe::Result {
     match cli::parse_args(std::env::args().skip(1)) {
         cli::ParsedArgs::Help => {
@@ -3252,7 +3309,13 @@ fn main() -> eframe::Result {
         cli::ParsedArgs::RunGui => {}
     }
 
-    let options = eframe::NativeOptions::default();
+    ensure_desktop_icon_installed();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id("redox-router")
+            .with_icon(load_app_icon()),
+        ..Default::default()
+    };
     eframe::run_native(
         "RedoxRouter",
         options,

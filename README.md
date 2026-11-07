@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src/icon/icon.svg" alt="RedoxRouter Logo" width="240" />
+</p>
+
 # RedoxRouter
 
 **A modern, node-based PipeWire patchbay and audio/video routing studio for Linux, written in Rust.**
